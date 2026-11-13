@@ -8,6 +8,17 @@ public class startingLine : MonoBehaviour
     string target = "body";
     PrivateAPI privateAPI;
 
+    void Awake()
+    {
+        // Segmentation: the start line lies on the road and is drivable -> class 1 (road).
+        if (GetComponent<Renderer>() != null && GetComponent<SegLabel>() == null)
+        {
+            SegLabel label = gameObject.AddComponent<SegLabel>();
+            label.classId = SegLabel.CLASS_ROAD;
+            label.Apply();
+        }
+    }
+
     void Start()
     {
         privateAPI = GameObject.FindObjectOfType<PrivateAPI>();

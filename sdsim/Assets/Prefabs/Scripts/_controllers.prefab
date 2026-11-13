@@ -151,6 +151,11 @@ MonoBehaviour:
   roadMaterials:
   - {fileID: 2100000, guid: 665c5390ee81f314b87ec4054073b845, type: 2}
   - {fileID: 2100000, guid: 938f9edd8aa7246489c24bcfd9bcefac, type: 2}
+  - {fileID: 2100000, guid: 649a7d29e8cf43fcaab43d0e363771e7, type: 2}
+  - {fileID: 2100000, guid: ed030d80f30142f4eb53f92b10d78114, type: 2}
+  - {fileID: 2100000, guid: 6580aa36b3224fbb8a8fba3a30f0d9ad, type: 2}
+  - {fileID: 2100000, guid: f8d7d3e40fe1e4941b9145116c0afcde, type: 2}
+  - {fileID: 2100000, guid: b669d52660ba4cfc92f4cccc6b31729d, type: 2}
   roadOffsets:
   - 2
   - 6

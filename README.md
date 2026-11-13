@@ -1,140 +1,208 @@
-# SdSandbox
+# DonkeyCar Simulator: Road Segmentation Fork
 
-Self Driving Car Sandbox
+[![Unity 2020.3.49f1](https://img.shields.io/badge/Unity-2020.3.49f1-black?logo=unity)](https://unity.com/releases/editor/archive)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](tools/requirements.txt)
+[![Fork of tawnkramer/sdsandbox](https://img.shields.io/badge/fork%20of-tawnkramer%2Fsdsandbox-lightgrey?logo=github)](https://github.com/tawnkramer/sdsandbox)
 
+A fork of the [DonkeyCar Unity simulator](https://github.com/tawnkramer/sdsandbox). It sends a
+**pixel-perfect drivable-road mask** along with every camera frame, and it can generate an
+**endless supply of seeded, randomised tracks**. Together these produce labelled data for
+training road-segmentation models.
 
-[![IMAGE ALT TEXT](https://img.youtube.com/vi/e0AFMilaeMI/0.jpg)](https://www.youtube.com/watch?v=e0AFMilaeMI "self driving car sim")
+<p align="center">
+  <img src="docs/assets/segmentation/rgb_mask_overlay.png" width="760"
+       alt="Camera image, segmentation mask and overlay for three tracks">
+</p>
 
+---
 
-## Summary
+## What this fork adds
 
-Use Unity 3d game engine to simulate car physics in a 3d world.
-Generate image steering pairs to train a neural network. Uses NVidia PilotNet NN topology.
-Then validate the steering control by sending images to your neural network and feed steering back into the simulator to drive.
+| Feature | Message | What you get |
+|---|---|---|
+| **Segmentation camera** | `seg_config` | An extra `image_seg` field in every `telemetry` message: a lossless PNG mask of the *same* frame, with the same size as `image`. **0 = background, 1 = drivable road.** |
+| **Procedural tracks** | `gen_track` | A closed-loop track built from a seed: shape, width, surface, line style and colours, and ground. The same seed always gives the same track. The sim replies with `track_info`. |
+| **More road styles** | `regen_road` | `road_style` 0–6: asphalt, dirt, cobblestone, sand and more, up from the original 2. |
+| **Scene labelling** | – | Existing scenes (`generated_track`, `mini_monaco`, `mountain_track`, `warren`) are labelled at load time. No scene file is edited. |
+| **Test tools** | – | `tools/check_seg.py` and `tools/check_trackgen.py`: automatic pass/fail checks plus overlays for a visual check. |
 
-## Some videos to help you get started
+The original RGB pipeline is **unchanged**: `image` is rendered and encoded exactly as before. A
+second, hidden camera renders the mask at the same moment, using a replacement shader.
 
-### Training your first network
-[![IMAGE ALT TEXT](https://img.youtube.com/vi/oe7fYuYw8GY/0.jpg)](https://www.youtube.com/watch?v=oe7fYuYw8GY "Getting Started w sdsandbox")
+<p align="center">
+  <img src="docs/assets/segmentation/track_variety.png" width="760"
+       alt="Overlays of the road mask on six different generated tracks and scenes">
+  <br><sub>Green = class 1 (road) and yellow = mask border, drawn on the RGB frame. Every <code>gen_track</code> seed gives a new track.</sub>
+</p>
 
-### World complexity
-[![IMAGE ALT TEXT](https://img.youtube.com/vi/FhAKaH3ysow/0.jpg)](https://www.youtube.com/watch?v=FhAKaH3ysow "Making a more interesting world.")
+## How it fits together
 
-### Creating a robust training set
-
-[![IMAGE ALT TEXT](https://img.youtube.com/vi/_h8l7qoT4zQ/0.jpg)](https://www.youtube.com/watch?v=_h8l7qoT4zQ "Creating a robust sdc.")
-
-## Setup
-
-You need to have [Unity](https://unity3d.com/get-unity/download) installed, and all python modules listed in the Requirements section below.
-
-Linix Unity install [here](https://forum.unity3d.com/threads/unity-on-linux-release-notes-and-known-issues.350256/). Check last post in this thread.
-
-You need python 3.4 or higher, 64 bit. You can create a virtual env if you like:
-```bash
-virtualenv -p python3 env
-source env/bin/activate
+```mermaid
+flowchart LR
+    A["<b>sdsandbox</b> (this repo)<br/>Unity project"] -- build --> B["donkey_sim.exe"]
+    B -- "TCP :9091<br/>image + image_seg" --> C["<b>DonkeyCar</b> project<br/>donkey_seg_datagen"]
+    C -- "RGB + mask PNGs" --> D["donkey_seg_train<br/>segmentation model"]
+    C -- "seg_config / gen_track" --> B
 ```
 
-And then you can install the dependancies. This installs a specific version of keras only because it will allow you to load the pre-trained model with fewer problems. If not an issue for you, you can install the latest keras.
-```bash
-pip install -r requirements.txt
+* **This repo:** the simulator source. Change it here when you need new labels, scenes or track
+  variety, then rebuild the `.exe`.
+* **[DonkeyCar project](https://github.com/AymaneLaabadi/donkeycar):** the Python side. It drives
+  the car, saves RGB + mask pairs (`donkey_seg_datagen`) and trains the model (`donkey_seg_train`).
+  It expects the build at `../Builds/Segmentation/donkey_sim.exe`.
+
+Recommended folder layout:
+
+```
+DonkeyCar Project/
+├── sdsandbox/                         ← this repo
+├── Builds/Segmentation/donkey_sim.exe ← your build of this repo
+└── DonkeyCar/                         ← data generation + training
 ```
 
-This will install [Donkey Gym](https://github.com/tawnkramer/donkey_gym) and [Donkey Car](https://github.com/tawnkramer/donkey) packages from source.
+## Quick start
 
-Note: Tensorflow >= 1.10.1 is required
+### 1. Build the simulator
 
-If you have an cuda supported GPU - probably NVidia
-```bash
-pip install tensorflow-gpu
-```
+1. Install **Unity 2020.3.49f1** with Unity Hub. Use this exact version to avoid re-importing
+   the project and getting noisy diffs.
+2. *Add project from disk* → `sdsandbox/sdsim`. The first import takes a few minutes.
+3. **File ▸ Build Settings ▸ Build**, and choose the output folder `DonkeyCar Project/Builds/Segmentation/`.
+   Name the executable `donkey_sim.exe`.
 
-Or without a supported gpu
-```bash
-pip install tensorflow
-```
+To try changes without building, open `Assets/Scenes/menu` and press **Play**. The sim then
+listens on `127.0.0.1:9091`, just like the `.exe`.
 
+### 2. Collect data
 
-## Demo
-
-1) Load the Unity project sdsandbox/sdsim in Unity. Double click on Assets/Scenes/road_generator to open that scene.  
-
-2) Hit the start button to launch. Then the "Use NN Steering". When you hit this button, the car will disappear. This is normal. You will see one car per client that connects.
-
-3) Start the prediction server with the pre-trained model.
+Use the [DonkeyCar project](https://github.com/AymaneLaabadi/donkeycar). Its README covers the
+install, the collector keys and the training. In short:
 
 ```bash
-cd sdsandbox/src
-python predict_client.py --model=../outputs/highway.h5
+cd DonkeyCar
+uv sync --extra torch
+uv run python -m donkey_seg_datagen.collect --split train
 ```
- If you get a crash loading this model, you will not be able to run the demo. But you can still generate your own model. This is a problem between tensorflow/keras versions.
 
- Note* You can start multiple clients at the same time and you will see them spawn as they connect.
+### 3. Or talk to the sim directly
 
- 
+Any [gym-donkeycar](https://github.com/tawnkramer/gym-donkeycar) client works. Send one extra message:
 
+```python
+import base64, io
+import gymnasium as gym, gym_donkeycar, numpy as np
+from PIL import Image
 
-#To create your own data and train
+env = gym.make("donkey-generated-roads-v0", conf={"exe_path": "../Builds/Segmentation/donkey_sim.exe"})
+handler = env.unwrapped.viewer.handler
+env.reset()
 
-## Generate training data
+handler.blocking_send({"msg_type": "gen_track", "seed": "42"})        # optional: random track #42
+handler.blocking_send({"msg_type": "seg_config", "enabled": "1"})     # turn the mask on
 
-1) Load the Unity project sdsandbox/sdsim in Unity.  
+# in every telemetry message from now on:
+# mask = np.asarray(Image.open(io.BytesIO(base64.b64decode(msg["image_seg"]))))[:, :, 0]  # HxW, values {0, 1}
+```
 
-2) Create a dir sdsandbox/sdsim/log.  
+## Message reference
 
-3) Hit the start arrow in Unity to launch project.  
+**`seg_config`**: turns the mask on or off for this connection. It is off by default.
 
-4) Hit button "Generate Training Data" to generate image and steering training data. See sdsim/log for output files.  
+```json
+{"msg_type": "seg_config", "enabled": "1"}
+```
 
-5) Stop Unity sim by clicking run arrow again.  
+`image_seg` is a base64 PNG with the same width and height as `image`. **Red channel = class id**;
+G and B are 0. Always resize masks with **nearest-neighbour** interpolation.
 
-6) Run this python script to prepare raw data for training:  
+**`gen_track`**: builds a seeded track in the `generated_road` scene (`donkey-generated-roads-v0`)
+and puts the car on the start line.
+
+```json
+{"msg_type": "gen_track", "seed": "123"}
+{"msg_type": "gen_track", "seed": "123", "base": "dirt", "edge_mode": "inset", "centre_mode": "dashed", "ground": "grass"}
+```
+
+| Override | Values (leave it out to draw the value from the seed) |
+|---|---|
+| `shape` | `oval`, `polar`, `s_bends` |
+| `road_width` | 3.5 – 13.5 m |
+| `base` | `asphalt_grey`, `asphalt_coarse`, `dirt`, `cobblestone`, `sand` |
+| `edge_mode` / `edge_inset` | `at_edge`, `inset` (+ 0.03 – 0.15 of the width), `none` |
+| `centre_mode` | `none`, `solid`, `dashed` |
+| `ground` | `sand`, `grass`, `mud`, `concrete`, `carpet` |
+| `return_nodes` | `"1"` adds the centreline nodes to the reply |
+
+The `track_info` reply contains the seed, every parameter that was drawn, the length, the minimum
+radius, the drivable band and a `hash`. Store it next to your data so each sample can be traced back to its track.
+
+**`regen_road`** (legacy roads): `{"msg_type": "regen_road", "road_style": "4", "rand_seed": "42"}`,
+with `road_style` 0–6.
+
+**Labelling rule:** class 1 covers the road surface from the outer edge of the left edge line to the
+outer edge of the right edge line, **lines included**. The start line also counts as road. Grass, kerbs and
+sidewalks painted into a road texture are class 0.
+
+## Scene support
+
+| Scene | Road mask | Status |
+|---|---|---|
+| `generated_road` (+ `gen_track`, `regen_road`) | built by the sim | ✅ verified (`check_seg`, `check_trackgen`) |
+| `generated_track` | built by the sim + start line | ✅ verified |
+| `mini_monaco` | rule in `SceneSegRules.cs` | ✅ verified (road present in 100 % of on-track frames) |
+| `mountain_track` | rule in `SceneSegRules.cs` | 🟡 overlays look right; automatic metric not applicable |
+| `warren` | built by the sim | 🟡 labelled, not yet checked |
+| `circuit_launch` | – | ❌ lanes exist only in the floor texture |
+| `warehouse`, `waveshare`, `roboracingleague_1`, `sparkfun_avc` | – | ❌ not supported |
+
+## Verifying changes
+
+Install the tool dependencies (`pip install -r tools/requirements.txt`). Start the sim (or pass
+`--exe`), then run:
 
 ```bash
-cd sdsandbox/src
-python prepare_data.py
+python tools/check_seg.py --gen-seeds 1 2 3 --frames 100   # masks valid, aligned, road visible → PASS/FAIL
+python tools/check_seg.py --env donkey-minimonaco-track-v0  # an existing scene
+python tools/check_trackgen.py --seeds 200                  # determinism + no overlapping or folding roads
+python tools/trackgen_ref.py --sheet 0 50                   # offline preview of track layouts (no sim needed)
 ```
 
-7) Repeat 4, 5, 6 until you have lots of training data.
+`check_seg.py` writes `rgb_*`, `mask_*`, `overlay_*` and `overlay_x4_*` images to `seg_check_out/`.
+Check the `overlay_x4` images: the yellow border must sit exactly on the road edge.
 
+> Extended telemetry (`cte`, `pos_*`) must be **on**. It is on by default; you can toggle it in the sim's main menu settings.
 
+## Working on the segmentation
 
-## Train Neural network
+| You want to… | Look at |
+|---|---|
+| Understand the rendering | [`docs/SEGMENTATION.md`](docs/SEGMENTATION.md) (full design notes) |
+| Change how the mask is rendered | `Assets/Scripts/segmentation/SegmentationSensor.cs`, `Assets/Resources/SegReplacement.shader` |
+| Mark an object as road | add a `SegLabel` component (`classId = 1`) |
+| Label a new scene | **Tools ▸ Segmentation ▸ Report Scene Renderers**, then add a rule in `SceneSegRules.cs` |
+| Add a road texture | material → `RoadBuilder.roadMaterials`; if its sides aren't road, add its drivable V-band in `SegRoadStyles.cs` |
+| Add a track surface or ground | `Assets/Scripts/trackgen/TrackMarkings.cs` (`Bases`, `Grounds`), ground materials in `Assets/Resources/Ground/` |
+| Change the track layouts | `TrackLayouts.cs` **and** `tools/trackgen_ref.py`. They are line-by-line twins with the same RNG, so keep them in sync. Then run `check_trackgen.py` |
+| Handle a new TCP message | `Assets/Scripts/tcp/TcpCarHandler.cs` |
+| Add the mask camera to a car prefab | **Tools ▸ Segmentation ▸ Add SegCam To Car Prefabs**. Without it, the camera is created at runtime with a warning |
 
-```bash
-python train.py --model=../outputs/mymodel.h5
-```
+**Workflow:** change the code → press Play in the editor or rebuild the `.exe` → run `check_seg.py` → check the overlays → open a PR.
 
-Let this run. It may take a few hours if running on CPU. Usually far less on a GPU.
+## Known limitations
 
+* **Fisheye** (`cam_config` `fish_eye_x/y`) only distorts the RGB image. Keep it at 0, or warp the
+  mask in Python with nearest-neighbour sampling.
+* **`step_mode synchronous` does not work** in this sim version. Use the default asynchronous mode.
+  RGB and mask are still rendered back to back for the same frame.
+* The second camera (`imageb`) has no mask.
+* Two classes only (road / background) for now.
 
+More details are in [docs/SEGMENTATION.md § Known limitations](docs/SEGMENTATION.md#known-limitations).
 
-## Run car with NN
+## Credits
 
-1) Start Unity project sdsim  
-
-
-2) Push button "Use NN Steering"
-
-
-3) Start the prediction client. This listens for images and returns a steering result.  
-
-```bash
-python predict_client.py --model=../outputs/mymodel.h5
-```
-
-
-
-## Requirements
-* [python 3.5+ 64 bit](https://www.python.org/)*
-* [tensorflow-1.10+](https://github.com/tensorflow/tensorflow)
-* [h5py](http://www.h5py.org/)  
-* [pillow](https://python-pillow.org/)  
-* [pygame](https://pypi.python.org/pypi/Pygame)**  
-* [Unity 2018.+](https://unity3d.com/get-unity/download)  
-
-
-**Note: pygame only needed if using mon_and_predict_server.py which gives a live camera feed during inferencing.
-
-
+Based on [tawnkramer/sdsandbox](https://github.com/tawnkramer/sdsandbox) (the DonkeyCar simulator)
+and [gym-donkeycar](https://github.com/tawnkramer/gym-donkeycar). For the original simulator
+documentation (creating tracks, the path manager, the private API), see [`docs/`](docs/README.md) and the
+[DonkeyCar docs](https://docs.donkeycar.com/guide/deep_learning/simulator/).
+Licensed under the original project's [LICENSE](LICENSE).

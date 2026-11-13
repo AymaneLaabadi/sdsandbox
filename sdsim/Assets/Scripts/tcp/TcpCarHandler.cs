@@ -23,6 +23,7 @@ namespace tk
         // Sensors
         public CameraSensor camSensor;
         public CameraSensor camSensorB;
+        public SegmentationSensor segSensor;
         public Lidar lidar;
         public Odometry[] odom;
 
@@ -47,6 +48,7 @@ namespace tk
         float time_step = 0.1f;
         bool bResetCar = false;
         bool bExitScene = false;
+        volatile bool sendSeg = false; // set by "seg_config" (network thread), read in SendTelemetry
 
         public enum State
         {
@@ -94,6 +96,8 @@ namespace tk
             client.dispatcher.Register("lidar_config", new tk.Delegates.OnMsgRecv(OnLidarConfig));
             client.dispatcher.Register("set_position", new tk.Delegates.OnMsgRecv(OnSetPosition));
             client.dispatcher.Register("node_position", new tk.Delegates.OnMsgRecv(OnNodePositionRecv));
+            client.dispatcher.Register("seg_config", new tk.Delegates.OnMsgRecv(OnSegConfig));
+            client.dispatcher.Register("gen_track", new tk.Delegates.OnMsgRecv(OnGenTrack));
         }
 
         public void Start()
@@ -148,6 +152,19 @@ namespace tk
             json.AddField("throttle", car.GetThrottle());
 
             json.AddField("image", Convert.ToBase64String(camSensor.GetImageBytes()));
+
+            if (sendSeg)
+            {
+                if (segSensor == null && camSensor != null)
+                {
+                    Debug.LogWarning("TcpCarHandler: segSensor not assigned on car prefab, creating SegCam at runtime.");
+                    segSensor = SegmentationSensor.CreateFor(camSensor);
+                }
+
+                byte[] seg = segSensor != null ? segSensor.CapturePng() : null;
+                if (seg != null)
+                    json.AddField("image_seg", Convert.ToBase64String(seg));
+            }
 
             if (camSensorB != null && camSensorB.gameObject.activeInHierarchy)
             {
@@ -294,6 +311,12 @@ namespace tk
             TrainingManager train_mgr = GameObject.FindObjectOfType<TrainingManager>();
             PathManager path_mgr = GameObject.FindObjectOfType<PathManager>();
 
+            // If gen_track moved the cars' saved start, put the scene spawn back first so
+            // regen_road behaves exactly as before.
+            TrackGenerator track_gen = GameObject.FindObjectOfType<TrackGenerator>();
+            if (track_gen != null && track_gen.HasGenerated)
+                track_gen.RestoreSpawnPoses();
+
             if (train_mgr != null)
             {
                 if (turn_increment != 0.0 && path_mgr != null)
@@ -304,6 +327,35 @@ namespace tk
                 UnityEngine.Random.InitState(rand_seed);
                 train_mgr.SetRoadStyle(road_style);
                 train_mgr.OnMenuRegenTrack();
+            }
+            else
+            {
+                // Scenes where the TrainingManager is disabled (e.g. generated_track,
+                // CarSpawner.EnableTrainingManager = 0): re-texture the RoadBuilder road on the
+                // same path. Road width/offset of the scene are kept (the per-style widths of
+                // RoadBuilder would not fit a fixed track layout).
+                RoadBuilder rb = GameObject.FindObjectOfType<RoadBuilder>();
+                if (rb != null && rb.doBuildRoad && path_mgr != null)
+                {
+                    float keepWidth = rb.roadWidth;
+                    float keepOffset = rb.roadOffsetW;
+
+                    if (turn_increment != 0.0 && path_mgr != null)
+                        path_mgr.turnInc = turn_increment;
+                    UnityEngine.Random.InitState(rand_seed);
+
+                    car.RestorePosRot();
+                    rb.DestroyRoad();
+                    rb.SetNewRoadVariation(road_style);
+                    rb.roadWidth = keepWidth;
+                    rb.roadOffsetW = keepOffset;
+                    path_mgr.InitCarPath();
+                    car.RequestFootBrake(1);
+                }
+                else
+                {
+                    Debug.LogWarning("regen_road ignored: no TrainingManager and no RoadBuilder with doBuildRoad in this scene.");
+                }
             }
 
             yield return null;
@@ -468,6 +520,57 @@ namespace tk
             }
 
             yield return null;
+        }
+
+        public void ResetActiveSpan()
+        {
+            iActiveSpan = 0;
+        }
+
+        void OnGenTrack(JSONObject json)
+        {
+            // Parse on the socket thread (pure), generate on the main thread.
+            GenTrackRequest req;
+            try
+            {
+                req = TrackGenerator.ParseRequest(json);
+            }
+            catch (Exception e)
+            {
+                JSONObject err = new JSONObject(JSONObject.Type.OBJECT);
+                err.AddField("msg_type", "track_info");
+                err.AddField("ok", false);
+                err.AddField("error", "bad gen_track request: " + e.Message);
+                client.SendMsg(err);
+                return;
+            }
+            UnityMainThreadDispatcher.Instance().Enqueue(GenTrack(req));
+        }
+
+        IEnumerator GenTrack(GenTrackRequest req)
+        {
+            JSONObject info = TrackGenerator.GetOrCreate().Generate(req, this);
+            if (client != null)
+                client.SendMsg(info);
+            yield return null;
+        }
+
+        void OnSegConfig(JSONObject json)
+        {
+            // {"msg_type": "seg_config", "enabled": "1"}  ("1"/"0"; also accepts true/false)
+            bool enabled = false;
+            JSONObject f = json.GetField("enabled");
+            if (f != null)
+            {
+                if (f.type == JSONObject.Type.BOOL)
+                    enabled = f.b;
+                else if (f.type == JSONObject.Type.NUMBER)
+                    enabled = f.n != 0;
+                else
+                    enabled = f.str != null && (f.str == "1" || f.str.ToLower() == "true");
+            }
+            sendSeg = enabled;
+            Debug.Log("seg_config: image_seg " + (sendSeg ? "enabled" : "disabled"));
         }
 
         void OnStepModeRecv(JSONObject json)

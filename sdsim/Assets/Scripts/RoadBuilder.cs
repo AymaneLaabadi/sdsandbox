@@ -130,6 +130,18 @@ public class RoadBuilder : MonoBehaviour, IWaitCarPath
 
         go.tag = "road_mesh";
 
+        // Segmentation: the whole generated road mesh is drivable surface (class 1).
+        SegLabel segLabel = go.GetComponent<SegLabel>();
+        if (segLabel == null)
+            segLabel = go.AddComponent<SegLabel>();
+        segLabel.classId = SegLabel.CLASS_ROAD;
+        // The road mesh footprint is the lane; materials like TransparentRoad only keep the
+        // painted lines after alpha-cutout, so label the full mesh regardless of alpha.
+        segLabel.ignoreAlpha = true;
+        // Textures with grass/kerbs painted at their sides: only the drivable band is road.
+        segLabel.drivableBandV = SegRoadStyles.GetDrivableBand(mr != null && mr.sharedMaterial != null ? mr.sharedMaterial.mainTexture : null);
+        segLabel.Apply();
+
         int numQuads = path.nodes.Count - 1;
         int numVerts = (numQuads + 1) * 2;
         int numTris = numQuads * 2;
@@ -264,6 +276,99 @@ public class RoadBuilder : MonoBehaviour, IWaitCarPath
 
             //terToolkit.TextureTerrain(slopeStops, heightStops, textures);
         }
+
+        return go;
+    }
+
+    /// <summary>
+    /// Closed-loop road mesh for gen_track (TrackGenerator). Unlike InitRoad (unchanged, used by
+    /// the existing scenes and regen_road): no lateral offset (the path IS the road centre), the
+    /// side direction is the averaged tangent at each node (no folding in curves), a closing ring
+    /// (no gap at the seam), and U = 0.1 * metres along the road (same texture density as
+    /// InitRoad at 2 m spacing). V = 0 on the Cross(tangent, up) side, as in InitRoad.
+    /// The road is labelled class 1 inside the drivable band (V range).
+    /// </summary>
+    public GameObject BuildGeneratedRoad(CarPath path, float halfWidth, Material material, Vector2 drivableBand)
+    {
+        GameObject go = GameObject.Instantiate(roadPrefabMesh);
+        MeshRenderer mr = go.GetComponent<MeshRenderer>();
+        MeshFilter mf = go.GetComponent<MeshFilter>();
+        MeshCollider mc = go.GetComponent<MeshCollider>();
+        createdRoad = go;
+
+        mr.sharedMaterial = material;
+
+        go.tag = "road_mesh";
+
+        int n = path.nodes.Count;
+        int rings = n + 1;
+        Vector3[] vertices = new Vector3[rings * 2];
+        Vector3[] normals = new Vector3[rings * 2];
+        Vector2[] uv = new Vector2[rings * 2];
+        int[] tri = new int[(rings - 1) * 6];
+
+        float acc = 0.0f;
+        Vector3 prevPos = Vector3.zero;
+        for (int r = 0; r < rings; r++)
+        {
+            int i = r % n;
+            Vector3 p = path.nodes[i].pos;
+            Vector3 prev = path.nodes[(i - 1 + n) % n].pos;
+            Vector3 next = path.nodes[(i + 1) % n].pos;
+            Vector3 t = next - prev;
+            t.y = 0.0f;
+            t.Normalize();
+            Vector3 side = Vector3.Cross(t, Vector3.up).normalized;
+
+            if (r > 0)
+            {
+                Vector2 d = new Vector2(p.x - prevPos.x, p.z - prevPos.z);
+                acc += d.magnitude;
+            }
+            prevPos = p;
+
+            Vector3 c = p;
+            c.y += roadHeightOffset;
+            vertices[2 * r] = c + side * halfWidth;
+            vertices[2 * r + 1] = c - side * halfWidth;
+            normals[2 * r] = Vector3.up;
+            normals[2 * r + 1] = Vector3.up;
+            uv[2 * r] = new Vector2(0.1f * acc, 0.0f);
+            uv[2 * r + 1] = new Vector2(0.1f * acc, 1.0f);
+        }
+
+        for (int q = 0; q < rings - 1; q++)
+        {
+            int v0 = 2 * q;
+            tri[6 * q + 0] = v0 + 0;
+            tri[6 * q + 1] = v0 + 2;
+            tri[6 * q + 2] = v0 + 1;
+            tri[6 * q + 3] = v0 + 2;
+            tri[6 * q + 4] = v0 + 3;
+            tri[6 * q + 5] = v0 + 1;
+        }
+
+        Mesh mesh = new Mesh();
+        if (vertices.Length > 65000)
+            mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
+        mesh.vertices = vertices;
+        mesh.triangles = tri;
+        mesh.normals = normals;
+        mesh.uv = uv;
+        mesh.RecalculateBounds();
+        mf.mesh = mesh;
+        if (mc != null)
+            mc.sharedMesh = mesh;
+
+        // the path is the road centre
+        path.centerNodes = new List<PathNode>(path.nodes);
+
+        SegLabel segLabel = go.GetComponent<SegLabel>();
+        if (segLabel == null)
+            segLabel = go.AddComponent<SegLabel>();
+        segLabel.classId = SegLabel.CLASS_ROAD;
+        segLabel.drivableBandV = drivableBand;
+        segLabel.Apply();
 
         return go;
     }

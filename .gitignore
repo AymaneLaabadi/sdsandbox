@@ -68,3 +68,14 @@ dataset
 /src/camera_b.png
 /sdsim/Assets/StreamingAssets
 /sdsim/Assets/AssetBundles
+
+# Virtual Environment
+.venv/
+__pycache__/
+
+# Outputs of the segmentation / trackgen test tools
+seg_check_out/
+layout_sheet/
+
+# Local logs
+unitylog.txt

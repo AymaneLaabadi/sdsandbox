@@ -1,0 +1,6 @@
+# Python deps for the test tools in this folder (check_seg.py, check_trackgen.py, trackgen_ref.py)
+numpy
+pillow
+gymnasium
+# gym-donkeycar 1.3.x is not on PyPI; same pinned commit as the companion DonkeyCar project
+gym-donkeycar @ git+https://github.com/tawnkramer/gym-donkeycar@a1f4ca6961e17a6929c1f2e883358a1edafb479d
