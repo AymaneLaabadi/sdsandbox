@@ -123,7 +123,7 @@ and puts the car on the start line.
 
 ```json
 {"msg_type": "gen_track", "seed": "123"}
-{"msg_type": "gen_track", "seed": "123", "base": "dirt", "edge_mode": "inset", "centre_mode": "dashed", "ground": "grass"}
+{"msg_type": "gen_track", "seed": "123", "base": "dirt", "centre_mode": "dashed"}
 ```
 
 | Override | Values (leave it out to draw the value from the seed) |
