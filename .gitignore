@@ -79,3 +79,5 @@ layout_sheet/
 
 # Local logs
 unitylog.txt
+
+/.claude/
