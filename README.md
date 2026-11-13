@@ -93,15 +93,18 @@ import base64, io
 import gymnasium as gym, gym_donkeycar, numpy as np
 from PIL import Image
 
-env = gym.make("donkey-generated-roads-v0", conf={"exe_path": "../Builds/Segmentation/donkey_sim.exe"})
+env = gym.make("donkey-generated-roads-v0",
+               conf={"exe_path": "../Builds/Segmentation/donkey_sim.exe"})
 handler = env.unwrapped.viewer.handler
 env.reset()
 
 handler.blocking_send({"msg_type": "gen_track", "seed": "42"})        # optional: random track #42
 handler.blocking_send({"msg_type": "seg_config", "enabled": "1"})     # turn the mask on
 
-# in every telemetry message from now on:
-# mask = np.asarray(Image.open(io.BytesIO(base64.b64decode(msg["image_seg"]))))[:, :, 0]  # HxW, values {0, 1}
+def decode_mask(msg):
+    """Every telemetry message from now on carries image_seg -> HxW uint8, values {0, 1}."""
+    png = base64.b64decode(msg["image_seg"])
+    return np.asarray(Image.open(io.BytesIO(png)))[:, :, 0]
 ```
 
 ## Message reference
@@ -161,10 +164,17 @@ Install the tool dependencies (`pip install -r tools/requirements.txt`). Start t
 `--exe`), then run:
 
 ```bash
-python tools/check_seg.py --gen-seeds 1 2 3 --frames 100   # masks valid, aligned, road visible → PASS/FAIL
-python tools/check_seg.py --env donkey-minimonaco-track-v0  # an existing scene
-python tools/check_trackgen.py --seeds 200                  # determinism + no overlapping or folding roads
-python tools/trackgen_ref.py --sheet 0 50                   # offline preview of track layouts (no sim needed)
+# masks valid, aligned, road visible → PASS/FAIL
+python tools/check_seg.py --gen-seeds 1 2 3 --frames 100
+
+# same check on an existing scene
+python tools/check_seg.py --env donkey-minimonaco-track-v0
+
+# determinism + no overlapping or folding roads
+python tools/check_trackgen.py --seeds 200
+
+# offline preview of track layouts (no sim needed)
+python tools/trackgen_ref.py --sheet 0 50
 ```
 
 `check_seg.py` writes `rgb_*`, `mask_*`, `overlay_*` and `overlay_x4_*` images to `seg_check_out/`.
