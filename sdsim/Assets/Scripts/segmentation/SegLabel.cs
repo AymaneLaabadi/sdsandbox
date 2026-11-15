@@ -39,6 +39,11 @@ public class SegLabel : MonoBehaviour
              "RoadBuilder roads from SegRoadStyles.")]
     public Vector2 drivableBandV = new Vector2(0f, 1f);
 
+    [Tooltip("Optional label texture in the same UV space as _MainTex (R > 0.5 = road). Only pixels " +
+             "where it says road keep the class id. For tracks painted into a floor texture.")]
+    public Texture labelMask;
+
+    static readonly int SegMaskProp = Shader.PropertyToID("_SegMask");
     MaterialPropertyBlock mpb;
 
     /// <summary>
@@ -75,7 +80,8 @@ public class SegLabel : MonoBehaviour
     /// </summary>
     public void Apply()
     {
-        Write(ClassToVector(classId, ignoreAlpha), new Vector4(drivableBandV.x, drivableBandV.y, 0f, 0f), false);
+        Write(ClassToVector(classId, ignoreAlpha),
+              new Vector4(drivableBandV.x, drivableBandV.y, labelMask != null ? 1f : 0f, 0f), false);
     }
 
     void Write(Vector4 value, Vector4 band, bool ignoreFilter)
@@ -106,6 +112,8 @@ public class SegLabel : MonoBehaviour
                 r.GetPropertyBlock(mpb, i);
                 mpb.SetVector(SegIdProp, value);
                 mpb.SetVector(SegBandProp, band);
+                if (band.z > 0.5f)
+                    mpb.SetTexture(SegMaskProp, labelMask);
                 r.SetPropertyBlock(mpb, i);
             }
         }

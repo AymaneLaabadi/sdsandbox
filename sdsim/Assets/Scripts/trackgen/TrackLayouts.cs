@@ -11,7 +11,8 @@ public struct V2
 
 public class LayoutResult
 {
-    public string shape;
+    public string shape;     // always "circuit"
+    public int corners;
     public double width;
     public List<V2> nodes;   // closed loop, node 0 = start
     public double step;      // node spacing (m)
@@ -21,14 +22,18 @@ public class LayoutResult
 }
 
 /// <summary>
-/// Seeded closed-loop track layouts for gen_track. Line-by-line port of tools/trackgen_ref.py
-/// (same SplitMix64 draws, double precision). Never uses UnityEngine.Random.
+/// Seeded closed-circuit layouts for gen_track. Line-by-line port of tools/trackgen_ref.py
+/// (same SplitMix64 draws and order, double precision). Never uses UnityEngine.Random.
+///
+/// Layout, like a real circuit: seeded points in a box -> convex hull; some hull edges get a
+/// notch (hairpins, chicanes; at least one per track); every corner of that polygon is rounded
+/// with its own radius -> true straights joined by constant-radius corners. Start = longest straight.
 ///
 /// Hard rules (a candidate that fails is replaced by the next attempt of the same seed):
 ///   min curve radius >= 1.5 * half width (no folding)
 ///   centreline self-distance >= width + 3 m for non-neighbouring parts
 ///   the two road edges never touch or cross
-///   length in [80, 450] m, control-point radii in [15, 70] m
+///   length in [80, 500] m
 /// </summary>
 public static class TrackLayouts
 {
@@ -36,44 +41,22 @@ public static class TrackLayouts
     public const double WidthMin = 3.5, WidthMax = 13.5;
     public const double MinRadiusFactor = 1.5;
     public const double Margin = 3.0;
-    public const double LenMin = 80.0, LenMax = 450.0;
-    public const double RMin = 15.0, RMax = 70.0;
+    public const double LenMin = 80.0, LenMax = 500.0;
     public const int MaxAttempts = 500;
-    public static readonly string[] Shapes = { "oval", "polar", "s_bends" };   // equal probability
+
+    // control polygon (same values as SETTINGS in trackgen_ref.py)
+    const double BoxMin = 30.0, BoxMax = 130.0, BoxWidthFactor = 10.0, AspectMin = 0.45;
+    const int PointsMin = 6, PointsMax = 16;
+    const double NotchPMin = 0.45, NotchPMax = 1.0, NotchDepthMin = 0.2, NotchDepthMax = 0.6;
+    const double NotchInwardP = 0.75, NotchMinEdge = 3.0;
+    // corners
+    const double CornerRMin = 4.0, CornerRMax = 40.0;
+    static readonly double MaxTurn = 165.0 * Math.PI / 180.0;
+    const double EdgeUse = 0.92, ArcStep = 0.5, StraightCurv = 1.0 / 200.0;
 
     // ------------------------------------------------------------------ geometry
 
     static int Mod(int a, int n) { int r = a % n; return r < 0 ? r + n : r; }
-
-    static List<V2> CatmullRomClosed(List<V2> ctrl, int samples = 32, double alpha = 0.5)
-    {
-        int n = ctrl.Count;
-        var outp = new List<V2>(n * samples);
-        for (int i = 0; i < n; i++)
-        {
-            V2 p0 = ctrl[Mod(i - 1, n)], p1 = ctrl[i], p2 = ctrl[(i + 1) % n], p3 = ctrl[(i + 2) % n];
-            double t0 = 0.0;
-            double t1 = t0 + Math.Pow(Math.Max(V2.Dist(p0, p1), 1e-6), alpha);
-            double t2 = t1 + Math.Pow(Math.Max(V2.Dist(p1, p2), 1e-6), alpha);
-            double t3 = t2 + Math.Pow(Math.Max(V2.Dist(p2, p3), 1e-6), alpha);
-            for (int k = 0; k < samples; k++)
-            {
-                double t = t1 + (t2 - t1) * k / samples;
-                outp.Add(new V2(CR(p0.x, p1.x, p2.x, p3.x, t0, t1, t2, t3, t), CR(p0.z, p1.z, p2.z, p3.z, t0, t1, t2, t3, t)));
-            }
-        }
-        return outp;
-    }
-
-    static double CR(double p0, double p1, double p2, double p3, double t0, double t1, double t2, double t3, double t)
-    {
-        double a1 = (t1 - t) / (t1 - t0) * p0 + (t - t0) / (t1 - t0) * p1;
-        double a2 = (t2 - t) / (t2 - t1) * p1 + (t - t1) / (t2 - t1) * p2;
-        double a3 = (t3 - t) / (t3 - t2) * p2 + (t - t2) / (t3 - t2) * p3;
-        double b1 = (t2 - t) / (t2 - t0) * a1 + (t - t0) / (t2 - t0) * a2;
-        double b2 = (t3 - t) / (t3 - t1) * a2 + (t - t1) / (t3 - t1) * a3;
-        return (t2 - t) / (t2 - t1) * b1 + (t - t1) / (t2 - t1) * b2;
-    }
 
     /// <summary>Equal arc-length nodes; spacing adjusted so the loop closes evenly.</summary>
     static List<V2> ResampleClosed(List<V2> pts, double spacing, out double step, out double length)
@@ -193,101 +176,229 @@ public static class TrackLayouts
         return "";
     }
 
-    // ------------------------------------------------------------------ shapes (unit radius)
+    // ------------------------------------------------------------------ circuit layouts
 
-    static List<V2> ShapePoints(string shape, SeededRng rng, out double rMinU, out double rMaxU)
+    static double Cross(V2 o, V2 a, V2 b) { return (a.x - o.x) * (b.z - o.z) - (a.z - o.z) * (b.x - o.x); }
+
+    /// <summary>Andrew's monotone chain, counter-clockwise, no collinear points.</summary>
+    static List<V2> ConvexHull(List<V2> input)
     {
-        int n;
-        Func<int, double, double> f;
-        if (shape == "oval")
+        var pts = new List<V2>(input);
+        pts.Sort((p, q) => p.x != q.x ? p.x.CompareTo(q.x) : p.z.CompareTo(q.z));
+        if (pts.Count < 3) return pts;
+        var lower = new List<V2>();
+        var upper = new List<V2>();
+        foreach (V2 p in pts)
         {
-            n = rng.IntIncl(12, 16);
-            double asp = rng.Range(1.0, 3.0);
-            f = (i, a) => rng.Range(0.96, 1.04) / Math.Sqrt(Math.Pow(Math.Cos(a) / asp, 2) + Math.Pow(Math.Sin(a), 2));
+            while (lower.Count >= 2 && Cross(lower[lower.Count - 2], lower[lower.Count - 1], p) <= 0) lower.RemoveAt(lower.Count - 1);
+            lower.Add(p);
         }
-        else if (shape == "polar")
+        for (int i = pts.Count - 1; i >= 0; i--)
         {
-            n = rng.IntIncl(6, 14);
-            double q = rng.Range(1.1, 3.5);
-            f = (i, a) => rng.Range(1.0, q);
+            V2 p = pts[i];
+            while (upper.Count >= 2 && Cross(upper[upper.Count - 2], upper[upper.Count - 1], p) <= 0) upper.RemoveAt(upper.Count - 1);
+            upper.Add(p);
         }
-        else // s_bends: alternating inner/outer control points
-        {
-            n = 2 * rng.IntIncl(3, 5);
-            double q = rng.Range(1.3, 2.0);
-            f = (i, a) => (i % 2 == 0 ? q : 1.0) * rng.Range(0.95, 1.05);
-        }
-        double step = 2 * Math.PI / n;
-        var ctrl = new List<V2>(n);
-        rMinU = double.PositiveInfinity;
-        rMaxU = 0.0;
-        for (int i = 0; i < n; i++)
-        {
-            double a = i * step + rng.Range(-0.3, 0.3) * step;
-            double r = f(i, a);
-            ctrl.Add(new V2(r * Math.Cos(a), r * Math.Sin(a)));
-            rMinU = Math.Min(rMinU, r);
-            rMaxU = Math.Max(rMaxU, r);
-        }
-        return CatmullRomClosed(ctrl);
+        lower.RemoveAt(lower.Count - 1);
+        upper.RemoveAt(upper.Count - 1);
+        lower.AddRange(upper);
+        return lower;
     }
 
-    static int StraightestStart(List<V2> nodes, int window = 5)
+    /// <summary>Signed heading change at b (radians, + = left turn).</summary>
+    static double TurnAngle(V2 a, V2 b, V2 c)
     {
-        int n = nodes.Count;
-        var curv = new double[n];
-        for (int i = 0; i < n; i++) curv[i] = Curvature(nodes, i);
-        int bestI = 0;
-        double bestV = double.PositiveInfinity;
+        double d1x = b.x - a.x, d1z = b.z - a.z, d2x = c.x - b.x, d2z = c.z - b.z;
+        return Math.Atan2(d1x * d2z - d1z * d2x, d1x * d2x + d1z * d2z);
+    }
+
+    static List<V2> ControlPolygon(SeededRng rng, double width)
+    {
+        double boxW = rng.Range(Math.Max(BoxMin, BoxWidthFactor * width), BoxMax);
+        double boxH = boxW * rng.Range(AspectMin, 1.0);
+        int nPts = rng.IntIncl(PointsMin, PointsMax);
+        var pts = new List<V2>(nPts);
+        for (int i = 0; i < nPts; i++)
+        {
+            double x = rng.Range(0.0, boxW);
+            double z = rng.Range(0.0, boxH);
+            pts.Add(new V2(x, z));
+        }
+        List<V2> hull = ConvexHull(pts);
+        double pNotch = rng.Range(NotchPMin, NotchPMax);
+        int m = hull.Count;
+        // every edge draws the same 4 numbers, used or not
+        var doNotch = new bool[m];
+        var tt = new double[m];
+        var depth = new double[m];
+        var inward = new bool[m];
+        var len = new double[m];
+        var eligible = new bool[m];
+        bool any = false;
+        for (int i = 0; i < m; i++)
+        {
+            len[i] = V2.Dist(hull[i], hull[(i + 1) % m]);
+            bool d = rng.Uniform() < pNotch;
+            tt[i] = rng.Range(0.35, 0.65);
+            depth[i] = rng.Range(NotchDepthMin, NotchDepthMax);
+            inward[i] = rng.Uniform() < NotchInwardP;
+            eligible[i] = len[i] >= NotchMinEdge * width;
+            doNotch[i] = d && eligible[i];
+            any |= doNotch[i];
+        }
+        if (!any)   // at least one notch per track: the longest eligible edge
+        {
+            int best = -1;
+            for (int i = 0; i < m; i++)
+                if (eligible[i] && (best < 0 || len[i] > len[best])) best = i;
+            if (best >= 0) doNotch[best] = true;
+        }
+        var poly = new List<V2>();
+        for (int i = 0; i < m; i++)
+        {
+            V2 a = hull[i], b = hull[(i + 1) % m];
+            poly.Add(a);
+            if (doNotch[i])
+            {
+                double L = len[i];
+                double nx = -(b.z - a.z) / L, nz = (b.x - a.x) / L;   // left normal = inside of a CCW hull
+                double s = depth[i] * L * (inward[i] ? 1.0 : -1.0);
+                poly.Add(new V2(a.x + (b.x - a.x) * tt[i] + nx * s, a.z + (b.z - a.z) * tt[i] + nz * s));
+            }
+        }
+        return poly;
+    }
+
+    /// <summary>Rounds every corner with its own radius; null if a corner cannot be rounded legally.</summary>
+    static List<V2> Fillet(List<V2> poly, double width, SeededRng rng, out int corners)
+    {
+        corners = 0;
+        int n = poly.Count;
+        double hw = width / 2.0;
+        double rLo = Math.Max(MinRadiusFactor * hw * 1.02, CornerRMin);
+        double rHi = Math.Max(CornerRMax, rLo);
+        var th = new double[n];
+        var t = new double[n];
+        var r = new double[n];
         for (int i = 0; i < n; i++)
         {
-            double v = 0.0;
-            for (int k = -window; k <= window; k++) v = Math.Max(v, curv[Mod(i + k, n)]);
-            if (v < bestV - 1e-12) { bestI = i; bestV = v; }
+            double a = TurnAngle(poly[Mod(i - 1, n)], poly[i], poly[(i + 1) % n]);
+            th[i] = a;
+            double rr = Math.Exp(rng.Range(Math.Log(rLo), Math.Log(rHi)));   // log-uniform: more tight corners
+            r[i] = rr;
+            t[i] = rr * Math.Tan(Math.Abs(a) / 2.0);
+        }
+        for (int i = 0; i < n; i++)
+            if (Math.Abs(th[i]) > MaxTurn) return null;
+        for (int pass = 0; pass < 2; pass++)   // tangent lengths of one edge must fit on it
+            for (int i = 0; i < n; i++)
+            {
+                int j = (i + 1) % n;
+                double L = V2.Dist(poly[i], poly[j]);
+                double s = t[i] + t[j];
+                if (s > EdgeUse * L)
+                {
+                    double k = EdgeUse * L / s;
+                    t[i] *= k;
+                    t[j] *= k;
+                }
+            }
+        for (int i = 0; i < n; i++)
+        {
+            r[i] = Math.Abs(th[i]) > 1e-9 ? t[i] / Math.Tan(Math.Abs(th[i]) / 2.0) : double.PositiveInfinity;
+            if (r[i] < rLo) return null;
+        }
+        var outp = new List<V2>();
+        for (int i = 0; i < n; i++)
+        {
+            V2 p = poly[i], a = poly[Mod(i - 1, n)];
+            double la = V2.Dist(a, p);
+            double dinx = (p.x - a.x) / la, dinz = (p.z - a.z) / la;
+            V2 e = new V2(p.x - dinx * t[i], p.z - dinz * t[i]);
+            if (Math.Abs(th[i]) <= 1e-9)
+            {
+                outp.Add(e);
+                continue;
+            }
+            corners++;
+            double sgn = th[i] > 0 ? 1.0 : -1.0;
+            V2 c = new V2(e.x - dinz * r[i] * sgn, e.z + dinx * r[i] * sgn);   // centre on the inside
+            double a0 = Math.Atan2(e.z - c.z, e.x - c.x);
+            int k = Math.Max((int)Math.Ceiling(Math.Abs(th[i]) * r[i] / ArcStep), 2);
+            for (int s = 0; s <= k; s++)
+            {
+                double ang = a0 + th[i] * s / k;
+                outp.Add(new V2(c.x + r[i] * Math.Cos(ang), c.z + r[i] * Math.Sin(ang)));
+            }
+        }
+        return outp;
+    }
+
+    /// <summary>Node index on the longest (near) straight, a little after its beginning.</summary>
+    static int LongestStraightStart(List<V2> nodes)
+    {
+        int n = nodes.Count;
+        var straight = new bool[n];
+        bool all = true, none = true;
+        for (int i = 0; i < n; i++)
+        {
+            straight[i] = Curvature(nodes, i) < StraightCurv;
+            all &= straight[i];
+            none &= !straight[i];
+        }
+        if (all || none) return 0;
+        int first = 0;
+        while (straight[first]) first++;   // rotate so a run never wraps
+        int bestI = 0, bestLen = -1, k = 0;
+        while (k < n)
+        {
+            if (straight[(first + k) % n])
+            {
+                int j = k;
+                while (j < n && straight[(first + j) % n]) j++;
+                if (j - k > bestLen)
+                {
+                    bestLen = j - k;
+                    bestI = (first + k + (int)((j - k) * 0.2)) % n;
+                }
+                k = j;
+            }
+            else k++;
         }
         return bestI;
     }
 
     /// <summary>Returns null if no candidate satisfied the rules within MaxAttempts.</summary>
-    public static LayoutResult Generate(ulong seed, double? roadWidth, string shapeOverride)
+    public static LayoutResult Generate(ulong seed, double? roadWidth)
     {
         double width = SeededRng.Sub(seed, "width").Range(WidthMin, WidthMax);
         if (roadWidth.HasValue) width = roadWidth.Value;
-        string shape = Shapes[SeededRng.Sub(seed, "shape").IntIncl(0, Shapes.Length - 1)];
-        if (!string.IsNullOrEmpty(shapeOverride)) shape = shapeOverride;
-        double hw = width / 2.0;
         SeededRng rng = SeededRng.Sub(seed, "layout");
 
         for (int attempt = 1; attempt <= MaxAttempts; attempt++)
         {
-            double rMinU, rMaxU;
-            List<V2> dense = ShapePoints(shape, rng, out rMinU, out rMaxU);
+            List<V2> poly = ControlPolygon(rng, width);
             double rot = rng.Range(0.0, 2 * Math.PI);
             bool flip = rng.Uniform() < 0.5;
-            double u = rng.Uniform();
-
-            double stepU, LU;
-            double minrU = MinRadius(ResampleClosed(dense, 0.05, out stepU, out LU));
-            double sLo = Math.Max(Math.Max(MinRadiusFactor * hw / minrU, LenMin / LU), RMin / rMinU);
-            double sHi = Math.Min(LenMax / LU, RMax / rMaxU);
-            if (sLo > sHi) continue;
-            double s = sLo + (sHi - sLo) * u;
+            int corners;
+            List<V2> dense = Fillet(poly, width, rng, out corners);
+            if (dense == null) continue;
 
             double c = Math.Cos(rot), sn = Math.Sin(rot);
             var pts = new List<V2>(dense.Count);
-            foreach (V2 p in dense) pts.Add(new V2(s * (p.x * c - p.z * sn), s * (p.x * sn + p.z * c)));
+            foreach (V2 p in dense) pts.Add(new V2(p.x * c - p.z * sn, p.x * sn + p.z * c));
             if (flip) pts.Reverse();
 
             double step, L;
             List<V2> nodes = ResampleClosed(pts, NodeSpacing, out step, out L);
             if (CheckRules(nodes, step, width) != "") continue;
 
-            int st = StraightestStart(nodes);
+            int st = LongestStraightStart(nodes);
             var rotated = new List<V2>(nodes.Count);
             for (int i = 0; i < nodes.Count; i++) rotated.Add(nodes[(st + i) % nodes.Count]);
             return new LayoutResult
             {
-                shape = shape, width = width, nodes = rotated, step = step, length = L,
+                shape = "circuit", corners = corners, width = width, nodes = rotated, step = step, length = L,
                 minRadius = MinRadius(rotated), attempts = attempt
             };
         }

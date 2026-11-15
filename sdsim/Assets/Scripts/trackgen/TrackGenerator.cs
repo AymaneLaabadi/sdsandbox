@@ -10,10 +10,9 @@ public class GenTrackRequest
 {
     public string seedText = "0";
     public ulong seed;
-    public string shape;          // null = from seed
     public double? roadWidth;     // null = from seed
-    public string baseSurface, edgeMode, centreMode, ground;   // null = from seed
-    public double? edgeInset;     // fraction of road width, inset mode
+    // null = from seed
+    public string surface, surfaceVariant, edgeColor, centreMode, centreColor, ground;
     public bool returnNodes;
 }
 
@@ -37,6 +36,7 @@ public class TrackGenerator : MonoBehaviour
     static Material roadMaterial;
     Renderer groundRenderer;
     Material groundOriginal;
+    Material carpetGround;
 
     public static TrackGenerator GetOrCreate()
     {
@@ -60,14 +60,12 @@ public class TrackGenerator : MonoBehaviour
         string s;
         if ((s = Field(json, "seed")) != null) r.seedText = s;
         r.seed = SeededRng.ParseSeed(r.seedText);
-        r.shape = Field(json, "shape");
-        if (r.shape != null && Array.IndexOf(TrackLayouts.Shapes, r.shape) < 0)
-            throw new ArgumentException("unknown shape '" + r.shape + "' (" + string.Join("|", TrackLayouts.Shapes) + ")");
         if ((s = Field(json, "road_width")) != null) r.roadWidth = double.Parse(s, CultureInfo.InvariantCulture);
-        if ((s = Field(json, "edge_inset")) != null) r.edgeInset = double.Parse(s, CultureInfo.InvariantCulture);
-        r.baseSurface = Field(json, "base");
-        r.edgeMode = Field(json, "edge_mode");
+        r.surface = Field(json, "surface");
+        r.surfaceVariant = Field(json, "surface_variant");
+        r.edgeColor = Field(json, "edge_color");
         r.centreMode = Field(json, "centre_mode");
+        r.centreColor = Field(json, "centre_color");
         r.ground = Field(json, "ground");
         r.returnNodes = Field(json, "return_nodes") == "1";
         return r;
@@ -87,12 +85,12 @@ public class TrackGenerator : MonoBehaviour
             if (pm == null || rb == null)
                 throw new InvalidOperationException("scene has no PathManager/RoadBuilder");
 
-            LayoutResult L = TrackLayouts.Generate(req.seed, req.roadWidth, req.shape);
+            LayoutResult L = TrackLayouts.Generate(req.seed, req.roadWidth);
             if (L == null)
                 throw new InvalidOperationException("no layout satisfied the rules in " + TrackLayouts.MaxAttempts + " attempts");
 
-            TrackMarkings mk = TrackMarkings.Sample(req.seed, L.width, rb.roadMaterials, req.baseSurface,
-                                                    req.edgeMode, req.edgeInset, req.centreMode, req.ground);
+            TrackMarkings mk = TrackMarkings.Sample(req.seed, L.width, req.surface, req.surfaceVariant, req.edgeColor,
+                                                    req.centreMode, req.centreColor, req.ground);
             if (roadMaterial == null)
                 roadMaterial = new Material(Resources.Load<Shader>("ProceduralRoad"));
 
@@ -117,7 +115,7 @@ public class TrackGenerator : MonoBehaviour
             GameObject road = rb.BuildGeneratedRoad(path, (float)(L.width / 2.0), roadMaterial, mk.Band);
             road.name = "generated_track_road";
             mk.Apply(road.GetComponent<Renderer>());
-            SetGround(mk.ground);
+            SetGround(mk);
             CreateStartLine(road.transform, path.nodes[0], path.nodes[0].pos.y + rb.roadHeightOffset, (float)L.width);
             foreach (GameObject go in pm.initAfterCarPathLoaded)
             {
@@ -139,13 +137,13 @@ public class TrackGenerator : MonoBehaviour
             string paramText = string.Format(CultureInfo.InvariantCulture, "shape={0};width={1:R};", L.shape, L.width) + mk.Describe();
             info.AddField("ok", true);
             info.AddField("shape", L.shape);
+            info.AddField("corners", L.corners);
             info.AddField("road_width", (float)L.width);
             info.AddField("length", (float)L.length);
             info.AddField("min_radius", (float)L.minRadius);
             info.AddField("totalNodes", n);
-            info.AddField("base", mk.baseName);
-            info.AddField("edge_mode", mk.edgeMode);
-            info.AddField("edge_inset", mk.edgeMode == "inset" ? (float)mk.edgeInset : 0f);
+            info.AddField("surface", mk.family);
+            info.AddField("surface_variant", mk.variant);
             info.AddField("edge_width", (float)mk.edgeWidth);
             info.AddField("edge_color", mk.edgeColorName);
             info.AddField("centre_mode", mk.centreMode);
@@ -240,8 +238,9 @@ public class TrackGenerator : MonoBehaviour
         h.ResetActiveSpan();
     }
 
-    /// <summary>Ground material by name ("sand" = the scene's own ground material).</summary>
-    void SetGround(string name)
+    /// <summary>Ground: carpet tracks get the same carpet as floor; others an outdoor ground by name
+    /// ("sand" = the scene's own ground material).</summary>
+    void SetGround(TrackMarkings mk)
     {
         if (groundRenderer == null)
         {
@@ -250,7 +249,13 @@ public class TrackGenerator : MonoBehaviour
             groundRenderer = g.GetComponent<Renderer>();
             groundOriginal = groundRenderer.sharedMaterial;
         }
-        Material m = name == "sand" ? null : Resources.Load<Material>("Ground/" + name);
+        if (carpetGround != null) Destroy(carpetGround);
+        carpetGround = null;
+        Material m;
+        if (mk.LinesOnly)
+            m = carpetGround = mk.MakeCarpetGround();
+        else
+            m = mk.ground == "sand" ? null : Resources.Load<Material>("Ground/" + mk.ground);
         groundRenderer.sharedMaterial = m != null ? m : groundOriginal;
     }
 

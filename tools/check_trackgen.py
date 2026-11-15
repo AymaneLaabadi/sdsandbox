@@ -6,7 +6,8 @@ For every seed:
   * generate twice -> the track_info "hash" must be identical (determinism)
   * re-check the hard rules on the nodes the sim returns (independent of the C# code):
       min curve radius >= 1.5 * half width, centreline self-distance >= width + 3 m for
-      non-neighbouring parts, road edges never touch, length in [80, 450] m
+      non-neighbouring parts, road edges never touch, length in [80, 500] m
+  * the layout equals the Python reference (tools/trackgen_ref.py) for the same seed
   * the car is at node 0 afterwards (telemetry activeNode 0, totalNodes matches)
 Prints PASS or FAIL (with the failing seeds) only.
 
@@ -83,11 +84,25 @@ def check_nodes(info):
     sd = ref.self_distance(nodes, step, w, ref.SETTINGS["margin"])
     if sd < w + ref.SETTINGS["margin"] - DIST_TOL:
         return "self distance %.2f < width + 3 = %.2f" % (sd, w + 3)
-    if not (80 - 1 <= step * n <= 450 + 1):
+    if not (ref.SETTINGS["len_min"] - 1 <= step * n <= ref.SETTINGS["len_max"] + 1):
         return "length %.1f" % (step * n)
     if ref.edges_touch(nodes, w / 2):
         return "road edges touch"
     return ""
+
+
+def compare_with_reference(seed, info):
+    """The sim's layout must be the Python reference layout (shifted so node 0 is the scene start)."""
+    r = ref.generate(seed)
+    if r is None:
+        return "reference has no layout"
+    nodes = [(float(p[0]), float(p[1])) for p in info["nodes"]]
+    if len(nodes) != len(r["nodes"]):
+        return "node count %d != reference %d" % (len(nodes), len(r["nodes"]))
+    x0, z0 = nodes[0]
+    rx0, rz0 = r["nodes"][0]
+    d = max(abs((x - x0) - (rx - rx0)) + abs((z - z0) - (rz - rz0)) for (x, z), (rx, rz) in zip(nodes, r["nodes"]))
+    return "differs from reference by %.3f m" % d if d > 0.01 else ""
 
 
 def main():
@@ -116,7 +131,7 @@ def main():
             continue
         if i1["hash"] != i2["hash"]:
             fails.append((seed, "hash differs %s / %s" % (i1["hash"], i2["hash"])))
-        why = check_nodes(i1)
+        why = check_nodes(i1) or compare_with_reference(seed, i1)
         if why:
             fails.append((seed, why))
         c.step(0.3)
@@ -131,7 +146,7 @@ def main():
         for s, why in fails:
             print("  seed %d: %s" % (s, why))
         sys.exit(1)
-    print("PASS (%d seeds: deterministic hash, no self-overlap, min radius ok, car at node 0)" % a.seeds)
+    print("PASS (%d seeds: deterministic hash, same as reference, no self-overlap, min radius ok, car at node 0)" % a.seeds)
 
 
 if __name__ == "__main__":
