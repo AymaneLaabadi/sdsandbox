@@ -129,23 +129,39 @@ Unknown textures label the whole mesh and log a warning once.
 
 ## Generated tracks (`gen_track`, scene generated_road)
 
-`gen_track` builds a seeded closed-loop track in **generated_road** (the only supported scene)
-and replies with `track_info`. The same seed always gives the same track (all randomness comes
-from a SplitMix64 generator seeded by `seed`; `UnityEngine.Random` is not used).
+`gen_track` builds a seeded closed circuit in **generated_road** (the only supported scene) and
+replies with `track_info`. The same seed always gives the same track (all randomness comes from a
+SplitMix64 generator seeded by `seed`; `UnityEngine.Random` is not used). This is the way to make
+training data; the legacy `regen_road` styles above are not used for it.
 
 ```json
 {"msg_type": "gen_track", "seed": "123"}
-{"msg_type": "gen_track", "seed": "123", "edge_mode": "inset", "edge_inset": "0.1", "centre_mode": "dashed"}
+{"msg_type": "gen_track", "seed": "123", "surface": "carpet", "surface_variant": "carpet_blue", "centre_mode": "none"}
 ```
 
-Optional overrides (strings; omit or leave empty = from the seed): `shape`, `road_width`,
-`base`, `edge_mode`, `edge_inset`, `centre_mode`, `ground`, `return_nodes` (`"1"` adds the
-node list to the reply). Forcing one value never changes the others.
+Optional overrides (strings; omit or leave empty = from the seed): `road_width`, `surface`,
+`surface_variant`, `edge_color`, `centre_mode`, `centre_color`, `ground`, `return_nodes`
+(`"1"` adds the node list to the reply). Every value is always drawn from the seed and then
+replaced by its override, so forcing one value never changes the others.
 
-**Layout.** Shapes `oval`, `polar` (random blob), `s_bends`, equal probability. Road width
-3.5–13.5 m (measured real tracks: waveshare 3.65 m … circuit_launch 13.3 m; car width 1.55 m).
-Length 80–450 m, control-point radii 15–70 m, node spacing ~2 m. Hard rules, a failing
-candidate is replaced by the next attempt of the same seed:
+### Layout (`TrackLayouts.cs`, Python twin `tools/trackgen_ref.py`)
+
+Built like a real circuit, so every seed has straights, corners of different radii, hairpins and
+chicanes:
+
+1. 6–16 seeded points in a box (30–130 m, at least 10 road widths, aspect 0.45–1) → convex hull.
+2. Each hull edge longer than 3 road widths gets a **notch** with a per-track probability of
+   0.45–1: a vertex pushed inwards (75 %) or outwards by 20–60 % of the edge length. Notches make the
+   hairpins, chicanes and bus stops. Every track has at least one.
+3. Every corner of that polygon is **rounded with its own radius** (log-uniform 4–40 m, so tight
+   corners are common; never tighter than the min-radius rule; corners may use at most 92 % of an
+   edge). Result: true straights joined by constant-radius arcs.
+4. Random rotation and direction; resampled to nodes every ~2 m; node 0 (start line, car) is placed
+   on the **longest straight**.
+
+Road width 3.5–13.5 m (measured real tracks: waveshare 3.65 m … circuit_launch 13.3 m; car width
+1.55 m), length 80–500 m. Hard rules, a failing candidate is replaced by the next attempt of the
+same seed (median 7 attempts, ≤ 62 over 300 seeds):
 * min curve radius ≥ 1.5 × half width (the road mesh never folds)
 * centreline distance ≥ road width + 3 m between parts that are not neighbours along the track
   (neighbours = closer than π/2 · (width + 3 m) along the centreline)
@@ -153,59 +169,97 @@ candidate is replaced by the next attempt of the same seed:
 
 The path is the road centre (`cte` = distance from the centre). The car is put on node 0,
 aligned with the road, velocity zero, `activeNode` 0; `reset_car` returns there. A start line
-(class 1, lap trigger) is placed at node 0. `regen_road` still works as before (legacy).
+(class 1, lap trigger) is placed at node 0.
 
-**Markings** (shader `Custom/ProceduralRoad`, parameters per road):
+### Look (`TrackMarkings.cs`, shader `Custom/ProceduralRoad`)
 
-| parameter | values (default probability / range) |
-|---|---|
-| `base` | `asphalt_grey`, `asphalt_coarse`, `dirt`, `cobblestone`, `sand` (equal); tint ×0.7–1.15 |
-| `edge_mode` | `at_edge` 0.45, `inset` 0.40, `none` 0.15 |
-| `edge_inset` | 0.03–0.15 of the road width (inset mode) |
-| edge line width | 0.12–0.45 m (≤ 12 % of road width), solid |
-| `centre_mode` | `none` 0.35, `solid` 0.25, `dashed` 0.40; width 0.10–0.30 m; dash 1–4 m, gap 1–4 m |
-| colours | white, yellow, orange, red, blue (+ small jitter), edge and centre independent |
-| wear | 0–0.35 (slight noise on the lines) |
-| `ground` | `sand` (scene default), `grass`, `mud`, `concrete`, `carpet` (equal; never sand on sand) |
+Every choice is independent and **uniform** (equal probability), in this order:
 
-**Labelling rule:** class 1 spans from the outer edge of the left edge line to the outer edge
-of the right edge line, lines included. `at_edge` and `none`: the whole road (V 0–1);
-`inset`: V in [inset, 1 − inset], the strip outside each line is class 0. Centre lines are always
-class 1. The shader draws the lines in the same V coordinate the segmentation shader uses for
-the band, with hard edges, so the line's outer edge and the mask edge are the same pixel.
+| step | choice | values |
+|---|---|---|
+| 1 | `surface` | `asphalt`, `concrete`, `dirt`, `sand`, `carpet` |
+| 1b | `surface_variant` (of that surface) | asphalt: `asphalt_grey`, `asphalt_coarse`, `asphalt_dark` · concrete: `concrete_cast`, `concrete_slab`, `concrete_panels`, `concrete_polished` · dirt: `dirt_track`, `dirt_rocky` · sand: `sand` · carpet: `carpet_office`, `carpet_weave`, `carpet_grey`, `carpet_blue`, `carpet_green`, `carpet_red` |
+| 2 | `edge_color` (both edge lines) | `white`, `yellow`, `orange`, `red`, `blue`, `green` |
+| 3 | centre line present? | yes / no |
+| 3b | `centre_mode` if present | `solid`, `dashed` (dash 1–4 m, gap 1–4 m) |
+| 3c | `centre_color` | same six colours, independent of the edge colour |
 
-**track_info:** `seed, shape, road_width, length, min_radius, totalNodes, base, edge_mode,
-edge_inset, edge_width, edge_color, centre_mode, centre_width, centre_color, dash, gap, ground,
-drivable_band, hash` (`hash` = FNV-1a over node positions and all parameters).
+Not random-by-category but varied per track: edge line width 3–7 % of the road width (≥ 0.15 m),
+centre line width 1.5–4 % (≥ 0.10 m), line wear 0–0.35, surface brightness ×0.85–1.1, small colour
+jitter.
 
-To add a base surface: append to `TrackMarkings.Bases` a texture that is in
-`RoadBuilder.roadMaterials` and its line-free V window. To add a ground: put a material in
-`Assets/Resources/Ground/` and add its name to `TrackMarkings.Grounds`.
+**Edge lines always exist and sit flush with the road edge**: left line V [0, w], right line
+[1 − w, 1]. The outermost line pixel is the outermost road pixel of the mask.
 
-Tests: `python tools/check_trackgen.py --seeds 200` (determinism + overlap rules, pass/fail);
-`python tools/check_seg.py --gen-seeds 1 2 3 [--edge-mode inset --edge-inset 0.12 ...]`
+**Ground:**
+* `carpet` tracks: the **whole floor is the same carpet** (shader `Custom/WorldGround`, mapped in
+  world space) and the road only draws its tape lines (`_LinesOnly`, every other road pixel is
+  discarded). The track exists only through its edge lines, like a taped indoor track; floor and
+  track surface are seamless by construction. The lines-only road casts no shadow.
+* other surfaces: `grass`, `mud`, `sand` (scene default), `concrete`, uniform among those that differ
+  from the road (no sand on sand, concrete on concrete or mud next to dirt).
+
+**Labelling rule:** class 1 = the whole road mesh = from the outer edge of the left edge line to
+the outer edge of the right edge line, lines included (V 0–1). Centre lines are inside class 1.
+The segmentation shader never clips, so on carpet tracks the mask still covers the whole track
+between the tapes.
+
+**track_info:** `seed, shape ("circuit"), corners, road_width, length, min_radius, totalNodes,
+surface, surface_variant, edge_width, edge_color, centre_mode, centre_width, centre_color, dash,
+gap, ground, drivable_band, hash` (`hash` = FNV-1a over node positions and all parameters).
+
+**Adding a surface variant:** make a material with the texture in `Assets/Resources/TrackSurfaces/`
+and add a `Variant` line to `TrackMarkings.Variants` (family, line-free V window or 0–1 for a whole
+seamless texture, metres per repeat, smoothness, linear tint). A new family also goes into
+`TrackMarkings.Families`. To add an outdoor ground: put a material in `Assets/Resources/Ground/`
+and add its name to `TrackMarkings.OutdoorGrounds`.
+
+Tests: `python tools/check_trackgen.py --seeds 200` (determinism, same layout as the Python
+reference, overlap rules; pass/fail); `python tools/check_seg.py --gen-seeds 1 2 3 [--surface carpet ...]`
 (masks and overlays). `python tools/trackgen_ref.py --check 200 / --sheet 0 200` runs the same
-layout algorithm offline (Python reference, same RNG).
+layout algorithm offline (Python reference, same RNG; the C# port gives the same nodes to 1e-12 m).
 
 ## Existing scenes
 
-Roads built by `RoadBuilder` and start lines (`startingLine`) label themselves. Plain road meshes
-of hand-made scenes are labelled at load time by `Scripts/segmentation/SceneSegRules.cs`
-(one rule per scene, by object or material name; no scene file is edited). To label another
-scene: list its renderers with **Tools ▸ Segmentation ▸ Report Scene Renderers**, add a rule,
-run `tools/check_seg.py --env <env-id>` and inspect the overlays.
+These scenes are for **evaluating** a model trained on `gen_track` data, not for training. Same
+labelling rule: road = between the outer edges of the boundary lines, lines included; everything
+else (walls, cones, carpet outside the tape, …) is background.
 
-| scene | road | status |
+Roads built by `RoadBuilder` and start lines (`startingLine`) label themselves. Hand-made scenes are
+labelled at load time by `Scripts/segmentation/SceneSegRules.cs` (rules by object or material name;
+no scene file is edited).
+
+**Tracks painted into a floor texture** (circuit_launch, roboracingleague_1) use a **label texture**:
+a black/white image in the UV space of the floor texture (`Assets/Resources/SegMasks/<scene>.png`,
+R8, point-filtered, no mipmaps). `SegLabel.labelMask` hands it to `Hidden/SegReplacement`, which
+samples it at exactly the UV the RGB shader samples the floor with, so the mask edge is the painted
+tape edge. The textures are built by `python tools/make_seg_masks.py` (previews in
+`seg_masks_preview/`):
+* **circuit_launch:** the track is painted into `CircuitLaunchDiffuse.png`. `CircuitLaunch.fbx` has a
+  road ribbon (`CircuitLaunchRoad`) that covers exactly the track; its UV polygons are rasterised and
+  grown into the white tape pixels connected to them (outer tape edge). The ribbon and the carpet
+  (`CircuitLaunchCarpet`) share the texture and overlap in depth, so **both** get the label texture:
+  whichever wins the depth test, the label is the same. (Labelling the ribbon alone failed for that
+  reason: the unlabelled carpet won near the camera.)
+* **roboracingleague_1:** two closed white tape loops on an alpha-cutout overlay quad
+  (`track_lines3`). The quad is drawn whole in the mask (`ignoreAlpha`) and the label texture keeps
+  the ring between the loops plus both tapes.
+
+| scene | how the road is labelled | status |
 |-------|------|--------|
-| generated_road | RoadBuilder / gen_track | confirmed |
-| generated_track | RoadBuilder + start line | confirmed |
-| warren | RoadBuilder (`TransparentRoad`, labelled with `ignoreAlpha`) | to check once (overlays) |
-| mini_monaco | object `miniMonacoRoad` | to check once (overlays) |
-| mountain_track | material `MountainTrackMat` | to check once (overlays) |
-| circuit_launch | object `CircuitLaunchRoad` | to check once; likely fails: the lanes are painted in the carpet texture |
-| warehouse, waveshare, roboracingleague_1, sparkfun_avc | – | dropped (track only exists in a texture / no road edges) |
+| generated_road | RoadBuilder / gen_track | ✅ verified |
+| generated_track | RoadBuilder + start line | ✅ verified |
+| mini_monaco | object `miniMonacoRoad` | ✅ verified (road in 100 % of on-track frames, overlays checked) |
+| warren | RoadBuilder (`TransparentRoad`, `ignoreAlpha`) | ✅ verified (100 %, mask spans the white edge lines) |
+| circuit_launch | label texture on `CircuitLaunchRoad` + `CircuitLaunchCarpet` | ✅ verified (100 %; mask edge = outermost tape pixel, measured per row) |
+| roboracingleague_1 | label texture on the `track_lines3` overlay | ✅ verified |
+| mountain_track | material `MountainTrackMat` | 🟡 overlays look right; not part of the evaluation set |
+| warehouse, waveshare, sparkfun_avc | – | not labelled |
 
-A scene that is not clean after the one check is dropped (remove its rule).
+To label another scene: list its renderers with **Tools ▸ Segmentation ▸ Report Scene Renderers**
+(or in batch mode `-executeMethod SegmentationTools.BatchReport -segScenes <a,b> -segOut <file>`), add a
+rule (and a label texture if the track is only painted), run `tools/check_seg.py --env <env-id>` and
+inspect the overlays.
 
 ## Known limitations
 

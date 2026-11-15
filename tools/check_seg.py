@@ -22,13 +22,12 @@ Usage (simulator already running, scene menu visible):
     python tools/check_seg.py --env donkey-generated-track-v0 --frames 300
     python tools/check_seg.py --styles 0,1,2,3,4,5,6 --frames 100     # legacy regen_road styles
     python tools/check_seg.py --gen-seeds 1 2 3 --frames 100           # gen_track tracks
-    python tools/check_seg.py --gen-seeds 7 --edge-mode inset --edge-inset 0.12 --centre-mode dashed
+    python tools/check_seg.py --gen-seeds 7 --surface carpet --centre-mode dashed
+    python tools/check_seg.py --env donkey-circuit-launch-track-v0     # evaluation scenes
 
-Road styles (regen_road road_style, see docs/SEGMENTATION.md):
-    0 asphalt, yellow centre line      4 dirt road
-    1 dark asphalt, dashed centre line 5 cobblestone
-    2 asphalt, white dashed centre     6 sand
-    3 asphalt, no centre line, kerbs
+gen_track overrides (see docs/SEGMENTATION.md): --surface asphalt|concrete|dirt|sand|carpet,
+--surface-variant, --edge-color, --centre-mode none|solid|dashed, --centre-color, --ground,
+--road-width.
 
 Note on --step-mode synchronous: in this fork the simulator's "step_mode synchronous"
 handler only sets Time.timeScale = 0 (from the socket thread) and nothing ever advances
@@ -56,6 +55,9 @@ except ImportError:  # older gym-donkeycar
     import gym
 
 import gym_donkeycar  # noqa: F401  (registers the donkey-* envs)
+
+
+GEN_OVERRIDES = ("road_width", "surface", "surface_variant", "edge_color", "centre_mode", "centre_color", "ground")
 
 
 class SegGrabber:
@@ -155,8 +157,8 @@ def main():
     ap.add_argument("--regen-wait", type=float, default=3.0, help="seconds to wait after regen_road/gen_track")
     ap.add_argument("--gen-seeds", type=int, nargs="*", default=None,
                     help="gen_track seeds (scene generated_road); records into <out>/gen_<seed>/")
-    for k in ("shape", "road-width", "base", "edge-mode", "edge-inset", "centre-mode", "ground"):
-        ap.add_argument("--" + k, default=None, help="gen_track override")
+    for k in GEN_OVERRIDES:
+        ap.add_argument("--" + k.replace("_", "-"), default=None, help="gen_track override")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -207,8 +209,7 @@ def main():
         runs = [(f"style_{st}", {"msg_type": "regen_road", "road_style": str(st), "rand_seed": str(args.seed),
                                  "turn_increment": "0"}) for st in args.styles.split(",")]
     if args.gen_seeds:
-        over = {k: getattr(args, k) for k in ("shape", "road_width", "base", "edge_mode", "edge_inset",
-                                              "centre_mode", "ground") if getattr(args, k) is not None}
+        over = {k: getattr(args, k) for k in GEN_OVERRIDES if getattr(args, k) is not None}
         runs = [(f"gen_{sd}", dict({"msg_type": "gen_track", "seed": str(sd)}, **over)) for sd in args.gen_seeds]
     track_infos = {}
     handler.fns["track_info"] = lambda m: track_infos.__setitem__(m.get("seed"), m)
@@ -231,8 +232,9 @@ def main():
                     continue
                 with open(os.path.join(out_dir, "track_info.json"), "w") as f:
                     json.dump(info, f, indent=1)
-                print("  " + ", ".join(f"{k}={info[k]}" for k in ("shape", "road_width", "base", "edge_mode",
-                                                                   "edge_inset", "centre_mode", "ground")))
+                print("  " + ", ".join(f"{k}={info.get(k)}" for k in (
+                    "corners", "road_width", "length", "surface", "surface_variant", "edge_color", "centre_mode",
+                    "centre_color", "ground")))
         failures = capture(env, grab, args, out_dir)
         results.append((name, out_dir, failures))
 

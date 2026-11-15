@@ -11,7 +11,8 @@ training road-segmentation models.
 
 <p align="center">
   <img src="docs/assets/segmentation/rgb_mask_overlay.png" width="760"
-       alt="Camera image, segmentation mask and overlay for three tracks">
+       alt="Camera image, segmentation mask and overlay for a carpet track, a concrete track, circuit_launch and roboracingleague">
+  <br><sub>Rows: generated carpet track (tape only), generated concrete track, and the evaluation scenes circuit_launch and roboracingleague_1.</sub>
 </p>
 
 ---
@@ -21,9 +22,9 @@ training road-segmentation models.
 | Feature | Message | What you get |
 |---|---|---|
 | **Segmentation camera** | `seg_config` | An extra `image_seg` field in every `telemetry` message: a lossless PNG mask of the *same* frame, with the same size as `image`. **0 = background, 1 = drivable road.** |
-| **Procedural tracks** | `gen_track` | A closed-loop track built from a seed: shape, width, surface, line style and colours, and ground. The same seed always gives the same track. The sim replies with `track_info`. |
+| **Procedural tracks** | `gen_track` | A realistic circuit built from a seed (straights, hairpins, chicanes) with a random surface (asphalt, concrete, dirt, sand or carpet), edge-line colour and centre line. The same seed always gives the same track. The sim replies with `track_info`. |
 | **More road styles** | `regen_road` | `road_style` 0–6: asphalt, dirt, cobblestone, sand and more, up from the original 2. |
-| **Scene labelling** | – | Existing scenes (`generated_track`, `mini_monaco`, `mountain_track`, `warren`) are labelled at load time. No scene file is edited. |
+| **Evaluation scenes** | – | `mini_monaco`, `warren`, `circuit_launch` and `roboracingleague_1` are labelled at load time, including tracks that only exist as tape painted into a floor texture. No scene file is edited. |
 | **Test tools** | – | `tools/check_seg.py` and `tools/check_trackgen.py`: automatic pass/fail checks plus overlays for a visual check. |
 
 The original RGB pipeline is **unchanged**: `image` is rendered and encoded exactly as before. A
@@ -31,8 +32,8 @@ second, hidden camera renders the mask at the same moment, using a replacement s
 
 <p align="center">
   <img src="docs/assets/segmentation/track_variety.png" width="760"
-       alt="Overlays of the road mask on six different generated tracks and scenes">
-  <br><sub>Green = class 1 (road) and yellow = mask border, drawn on the RGB frame. Every <code>gen_track</code> seed gives a new track.</sub>
+       alt="Camera images of four generated tracks with different surfaces and two evaluation scenes">
+  <br><sub>Camera images: four <code>gen_track</code> tracks (surface, edge colour and centre line drawn independently per seed; on carpet only the tape marks the track) and two evaluation scenes.</sub>
 </p>
 
 ## How it fits together
@@ -118,28 +119,43 @@ def decode_mask(msg):
 `image_seg` is a base64 PNG with the same width and height as `image`. **Red channel = class id**;
 G and B are 0. Always resize masks with **nearest-neighbour** interpolation.
 
-**`gen_track`**: builds a seeded track in the `generated_road` scene (`donkey-generated-roads-v0`)
-and puts the car on the start line.
+**`gen_track`**: builds a seeded circuit in the `generated_road` scene (`donkey-generated-roads-v0`)
+and puts the car on its longest straight.
 
 ```json
 {"msg_type": "gen_track", "seed": "123"}
-{"msg_type": "gen_track", "seed": "123", "base": "dirt", "centre_mode": "dashed"}
+{"msg_type": "gen_track", "seed": "123", "surface": "carpet", "centre_mode": "none"}
 ```
 
-| Override | Values (leave it out to draw the value from the seed) |
-|---|---|
-| `shape` | `oval`, `polar`, `s_bends` |
-| `road_width` | 3.5 – 13.5 m |
-| `base` | `asphalt_grey`, `asphalt_coarse`, `dirt`, `cobblestone`, `sand` |
-| `edge_mode` / `edge_inset` | `at_edge`, `inset` (+ 0.03 – 0.15 of the width), `none` |
-| `centre_mode` | `none`, `solid`, `dashed` |
-| `ground` | `sand`, `grass`, `mud`, `concrete`, `carpet` |
-| `return_nodes` | `"1"` adds the centreline nodes to the reply |
+**Layout:** like a real circuit. A seeded polygon (convex hull plus notches) has every corner rounded
+with its own radius. That gives straights, hairpins, chicanes and sweepers; every seed is different.
 
-The `track_info` reply contains the seed, every parameter that was drawn, the length, the minimum
-radius, the drivable band and a `hash`. Store it next to your data so each sample can be traced back to its track.
+<p align="center">
+  <img src="docs/assets/segmentation/track_layouts.png" width="900"
+       alt="Top view of twelve generated circuits; the red mark is the start line">
+  <br><sub>Twelve <code>gen_track</code> seeds, top view (red = start line, always on the longest straight).</sub>
+</p>
 
-**`regen_road`** (legacy roads): `{"msg_type": "regen_road", "road_style": "4", "rand_seed": "42"}`,
+**Look:** every choice is independent and uniform, in this order:
+
+| Step | Override | Values (leave it out to draw the value from the seed) |
+|---|---|---|
+| 1 | `surface` | `asphalt`, `concrete`, `dirt`, `sand`, `carpet` |
+| 1b | `surface_variant` | a variant of that surface, e.g. `asphalt_dark`, `concrete_panels`, `carpet_blue` ([full list](docs/SEGMENTATION.md#look-trackmarkingscs-shader-customproceduralroad)) |
+| 2 | `edge_color` | `white`, `yellow`, `orange`, `red`, `blue`, `green`. Edge lines always exist, flush with the road edge |
+| 3 | `centre_mode` | none or present; if present `solid` or `dashed` |
+| 3b | `centre_color` | same six colours |
+| – | `ground` | outdoor floor for non-carpet tracks: `grass`, `mud`, `sand`, `concrete` |
+| – | `road_width` | 3.5 – 13.5 m |
+| – | `return_nodes` | `"1"` adds the centreline nodes to the reply |
+
+On **carpet** tracks, the whole floor is that carpet and the track exists only through its tape lines,
+like a real indoor track.
+
+The `track_info` reply contains the seed, every parameter that was drawn, the corner count, length,
+minimum radius and a `hash`. Store it next to your data so each sample can be traced back to its track.
+
+**`regen_road`** (legacy roads, not used for training data): `{"msg_type": "regen_road", "road_style": "4", "rand_seed": "42"}`,
 with `road_style` 0–6.
 
 **Labelling rule:** class 1 covers the road surface from the outer edge of the left edge line to the
@@ -153,10 +169,14 @@ sidewalks painted into a road texture are class 0.
 | `generated_road` (+ `gen_track`, `regen_road`) | built by the sim | ✅ verified (`check_seg`, `check_trackgen`) |
 | `generated_track` | built by the sim + start line | ✅ verified |
 | `mini_monaco` | rule in `SceneSegRules.cs` | ✅ verified (road present in 100 % of on-track frames) |
-| `mountain_track` | rule in `SceneSegRules.cs` | 🟡 overlays look right; automatic metric not applicable |
-| `warren` | built by the sim | 🟡 labelled, not yet checked |
-| `circuit_launch` | – | ❌ lanes exist only in the floor texture |
-| `warehouse`, `waveshare`, `roboracingleague_1`, `sparkfun_avc` | – | ❌ not supported |
+| `warren` | built by the sim | ✅ verified |
+| `circuit_launch` | label texture (track painted into the carpet) | ✅ verified, mask edge = outermost tape pixel |
+| `roboracingleague_1` | label texture (tape loops on an overlay) | ✅ verified |
+| `mountain_track` | rule in `SceneSegRules.cs` | 🟡 overlays look right; not in the evaluation set |
+| `warehouse`, `waveshare`, `sparkfun_avc` | – | ❌ not labelled |
+
+`mini_monaco`, `warren`, `circuit_launch` and `roboracingleague_1` are the **evaluation scenes**:
+use them to test a model trained on `gen_track` data, not to train it.
 
 ## Verifying changes
 
@@ -191,7 +211,8 @@ Check the `overlay_x4` images: the yellow border must sit exactly on the road ed
 | Mark an object as road | add a `SegLabel` component (`classId = 1`) |
 | Label a new scene | **Tools ▸ Segmentation ▸ Report Scene Renderers**, then add a rule in `SceneSegRules.cs` |
 | Add a road texture | material → `RoadBuilder.roadMaterials`; if its sides aren't road, add its drivable V-band in `SegRoadStyles.cs` |
-| Add a track surface or ground | `Assets/Scripts/trackgen/TrackMarkings.cs` (`Bases`, `Grounds`), ground materials in `Assets/Resources/Ground/` |
+| Add a track surface or ground | `Assets/Scripts/trackgen/TrackMarkings.cs` (`Variants`, `OutdoorGrounds`), surface materials in `Assets/Resources/TrackSurfaces/`, ground materials in `Assets/Resources/Ground/` |
+| Label a track that is painted into a floor texture | `tools/make_seg_masks.py` (label texture in the floor's UV space) + a rule in `SceneSegRules.cs` |
 | Change the track layouts | `TrackLayouts.cs` **and** `tools/trackgen_ref.py`. They are line-by-line twins with the same RNG, so keep them in sync. Then run `check_trackgen.py` |
 | Handle a new TCP message | `Assets/Scripts/tcp/TcpCarHandler.cs` |
 | Add the mask camera to a car prefab | **Tools ▸ Segmentation ▸ Add SegCam To Car Prefabs**. Without it, the camera is created at runtime with a warning |

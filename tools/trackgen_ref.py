@@ -1,18 +1,26 @@
 #!/usr/bin/env python
 """
-Reference implementation of the gen_track layout generator (closed loops only).
+Reference implementation of the gen_track layout generator (closed circuits).
 sdsim/Assets/Scripts/trackgen/TrackLayouts.cs is a line-by-line port (same SplitMix64 RNG and
 draw order, double precision).
 
     python tools/trackgen_ref.py --check 200            # rule check over 200 seeds (pass/fail)
     python tools/trackgen_ref.py --sheet 0 200 --out x  # contact sheet incl. the tightest tracks
 
+Layout (like a real circuit):
+  1. seeded points in a box -> convex hull (counter-clockwise)
+  2. some hull edges get a notch (a vertex pushed inwards or outwards): hairpins, chicanes,
+     bus stops; at least one notch per track
+  3. every corner of that polygon is rounded with its own radius (log-uniform 4..40 m, never
+     tighter than the min-radius rule): true straights joined by constant-radius corners
+  4. random rotation and direction, resampled to nodes every ~2 m, start on the longest straight
+
 Hard rules for every track:
   * min curve radius            >= 1.5 * half width              (no folding)
   * centreline self-distance    >= road width + 3 m   for parts that are not neighbours
     (neighbours = closer than pi/2 * (width + 3 m) along the track)
   * the two road edges (left/right boundary polylines) never touch or cross
-  * length in [80, 450] m, all control-point radii in [15, 70] m
+  * length in [80, 500] m
 A failed candidate is replaced by the next attempt from the same seed.
 """
 import argparse
@@ -28,12 +36,29 @@ SETTINGS = {
     "min_radius_factor": 1.5,
     "margin": 3.0,
     "len_min": 80.0,
-    "len_max": 450.0,
-    "r_min": 15.0,
-    "r_max": 70.0,
+    "len_max": 500.0,
     "max_attempts": 500,
+    # control polygon
+    "box_min": 30.0,             # m, size of the area the circuit is laid out in
+    "box_max": 130.0,
+    "box_width_factor": 10.0,    # box >= 10 road widths
+    "aspect_min": 0.45,
+    "points_min": 6,
+    "points_max": 16,
+    "notch_p_min": 0.45,         # per-track probability that a hull edge gets a notch
+    "notch_p_max": 1.0,
+    "notch_depth_min": 0.2,      # notch depth as a fraction of the edge length
+    "notch_depth_max": 0.6,
+    "notch_inward_p": 0.75,
+    "notch_min_edge": 3.0,       # only edges longer than 3 road widths are notched
+    # corners
+    "corner_r_min": 4.0,         # m (and >= 1.5 * half width)
+    "corner_r_max": 40.0,
+    "max_turn": math.radians(165.0),
+    "edge_use": 0.92,            # corners may use at most 92 % of an edge
+    "arc_step": 0.5,             # m, arc sampling before resampling
+    "straight_curv": 1.0 / 200.0,
 }
-SHAPES = ["oval", "polar", "s_bends"]   # equal probability
 
 
 class Rng:
@@ -76,29 +101,6 @@ def dist(a, b):
 
 
 # ---------------------------------------------------------------- geometry
-def catmull_rom_closed(ctrl, samples=32, alpha=0.5):
-    n = len(ctrl)
-    out = []
-    for i in range(n):
-        p0, p1, p2, p3 = ctrl[(i - 1) % n], ctrl[i], ctrl[(i + 1) % n], ctrl[(i + 2) % n]
-        t0 = 0.0
-        t1 = t0 + max(dist(p0, p1), 1e-6) ** alpha
-        t2 = t1 + max(dist(p1, p2), 1e-6) ** alpha
-        t3 = t2 + max(dist(p2, p3), 1e-6) ** alpha
-        for k in range(samples):
-            t = t1 + (t2 - t1) * k / samples
-            pt = []
-            for c in range(2):
-                a1 = (t1 - t) / (t1 - t0) * p0[c] + (t - t0) / (t1 - t0) * p1[c]
-                a2 = (t2 - t) / (t2 - t1) * p1[c] + (t - t1) / (t2 - t1) * p2[c]
-                a3 = (t3 - t) / (t3 - t2) * p2[c] + (t - t2) / (t3 - t2) * p3[c]
-                b1 = (t2 - t) / (t2 - t0) * a1 + (t - t0) / (t2 - t0) * a2
-                b2 = (t3 - t) / (t3 - t1) * a2 + (t - t1) / (t3 - t1) * a3
-                pt.append((t2 - t) / (t2 - t1) * b1 + (t - t1) / (t2 - t1) * b2)
-            out.append((pt[0], pt[1]))
-    return out
-
-
 def resample_closed(pts, spacing):
     """Equal arc-length nodes; spacing adjusted so the loop closes evenly."""
     seg = list(zip(pts, pts[1:] + [pts[0]]))
@@ -197,71 +199,169 @@ def check_rules(nodes, step, width, P=SETTINGS):
     return ""
 
 
-# ---------------------------------------------------------------- shapes (unit radius)
-def shape_points(shape, rng):
-    if shape == "oval":
-        n = rng.int_incl(12, 16)
-        asp = rng.range(1.0, 3.0)
-        f = lambda i, a: rng.range(0.96, 1.04) / math.sqrt((math.cos(a) / asp) ** 2 + math.sin(a) ** 2)
-    elif shape == "polar":
-        n = rng.int_incl(6, 14)
-        q = rng.range(1.1, 3.5)
-        f = lambda i, a: rng.range(1.0, q)
-    else:  # s_bends: alternating inner/outer control points
-        n = 2 * rng.int_incl(3, 5)
-        q = rng.range(1.3, 2.0)
-        f = lambda i, a: (q if i % 2 == 0 else 1.0) * rng.range(0.95, 1.05)
-    step = 2 * math.pi / n
-    ctrl, rs = [], []
+# ---------------------------------------------------------------- circuit layouts
+# A track is built like a real circuit: a control polygon (convex hull of seeded points, with
+# some edges notched inwards/outwards for hairpins and chicanes) whose corners are rounded with
+# individual radii. Result: true straights joined by constant-radius corners.
+def convex_hull(pts):
+    """Andrew's monotone chain, counter-clockwise, no collinear points."""
+    pts = sorted(pts)
+    if len(pts) < 3:
+        return pts
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower, upper = [], []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
+
+
+def turn_angle(a, b, c):
+    """Signed heading change at b (radians, + = left turn)."""
+    d1x, d1z = b[0] - a[0], b[1] - a[1]
+    d2x, d2z = c[0] - b[0], c[1] - b[1]
+    return math.atan2(d1x * d2z - d1z * d2x, d1x * d2x + d1z * d2z)
+
+
+def control_polygon(rng, width, P):
+    box_w = rng.range(max(P["box_min"], P["box_width_factor"] * width), P["box_max"])
+    box_h = box_w * rng.range(P["aspect_min"], 1.0)
+    n_pts = rng.int_incl(P["points_min"], P["points_max"])
+    pts = [(rng.range(0.0, box_w), rng.range(0.0, box_h)) for _ in range(n_pts)]
+    hull = convex_hull(pts)
+    p_notch = rng.range(P["notch_p_min"], P["notch_p_max"])
+    m = len(hull)
+    # every edge draws the same 4 numbers, used or not (keeps the draw order simple to port)
+    edges = []
+    for i in range(m):
+        a, b = hull[i], hull[(i + 1) % m]
+        L = dist(a, b)
+        do_notch = rng.uniform() < p_notch
+        t = rng.range(0.35, 0.65)
+        depth = rng.range(P["notch_depth_min"], P["notch_depth_max"])
+        inward = rng.uniform() < P["notch_inward_p"]
+        eligible = L >= P["notch_min_edge"] * width
+        edges.append([do_notch and eligible, t, depth, inward, L, eligible])
+    if not any(e[0] for e in edges):   # at least one notch per track: the longest eligible edge
+        best = -1
+        for i in range(m):
+            if edges[i][5] and (best < 0 or edges[i][4] > edges[best][4]):
+                best = i
+        if best >= 0:
+            edges[best][0] = True
+    poly = []
+    for i in range(m):
+        a, b = hull[i], hull[(i + 1) % m]
+        poly.append(a)
+        do_notch, t, depth, inward, L, _ = edges[i]
+        if do_notch:
+            nx, nz = -(b[1] - a[1]) / L, (b[0] - a[0]) / L    # left normal = inside of a CCW hull
+            s = depth * L * (1.0 if inward else -1.0)
+            poly.append((a[0] + (b[0] - a[0]) * t + nx * s, a[1] + (b[1] - a[1]) * t + nz * s))
+    return poly
+
+
+def fillet(poly, width, rng, P):
+    """Rounds every corner with its own radius. Returns dense points (or None) and the radii."""
+    n = len(poly)
+    hw = width / 2.0
+    r_lo = max(P["min_radius_factor"] * hw * 1.02, P["corner_r_min"])
+    r_hi = max(P["corner_r_max"], r_lo)
+    th, t, r = [], [], []
     for i in range(n):
-        a = i * step + rng.range(-0.3, 0.3) * step
-        r = f(i, a)
-        ctrl.append((r * math.cos(a), r * math.sin(a)))
-        rs.append(r)
-    return catmull_rom_closed(ctrl), min(rs), max(rs)
+        a = turn_angle(poly[i - 1], poly[i], poly[(i + 1) % n])
+        th.append(a)
+        rr = math.exp(rng.range(math.log(r_lo), math.log(r_hi)))   # log-uniform: more tight corners
+        r.append(rr)
+        t.append(rr * math.tan(abs(a) / 2.0))
+    for i in range(n):
+        if abs(th[i]) > P["max_turn"]:
+            return None, None
+    for _ in range(2):   # tangent lengths of one edge must fit on it (leave a short straight)
+        for i in range(n):
+            j = (i + 1) % n
+            L = dist(poly[i], poly[j])
+            s = t[i] + t[j]
+            if s > P["edge_use"] * L:
+                k = P["edge_use"] * L / s
+                t[i] *= k
+                t[j] *= k
+    for i in range(n):
+        r[i] = t[i] / math.tan(abs(th[i]) / 2.0) if abs(th[i]) > 1e-9 else float("inf")
+        if r[i] < r_lo:
+            return None, None
+    out = []
+    for i in range(n):
+        p, a = poly[i], poly[i - 1]
+        la = dist(a, p)
+        din = ((p[0] - a[0]) / la, (p[1] - a[1]) / la)
+        e = (p[0] - din[0] * t[i], p[1] - din[1] * t[i])
+        if abs(th[i]) <= 1e-9:
+            out.append(e)
+            continue
+        sgn = 1.0 if th[i] > 0 else -1.0
+        c = (e[0] - din[1] * r[i] * sgn, e[1] + din[0] * r[i] * sgn)   # centre on the inside
+        a0 = math.atan2(e[1] - c[1], e[0] - c[0])
+        k = max(int(math.ceil(abs(th[i]) * r[i] / P["arc_step"])), 2)
+        for s in range(k + 1):
+            ang = a0 + th[i] * s / k
+            out.append((c[0] + r[i] * math.cos(ang), c[1] + r[i] * math.sin(ang)))
+    return out, r
 
 
-def straightest_start(nodes, window=5):
+def longest_straight_start(nodes, step, P):
+    """Node index on the longest (near) straight, a little after its beginning."""
     n = len(nodes)
-    curv = [curvature(nodes, i) for i in range(n)]
-    best_i, best_v = 0, float("inf")
-    for i in range(n):
-        v = max(curv[(i + k) % n] for k in range(-window, window + 1))
-        if v < best_v - 1e-12:
-            best_i, best_v = i, v
+    straight = [curvature(nodes, i) < P["straight_curv"] for i in range(n)]
+    if all(straight) or not any(straight):
+        return 0
+    first = next(i for i in range(n) if not straight[i])   # rotate so a run never wraps
+    best_i, best_len, i = 0, -1, 0
+    while i < n:
+        idx = (first + i) % n
+        if straight[idx]:
+            j = i
+            while j < n and straight[(first + j) % n]:
+                j += 1
+            if j - i > best_len:
+                best_len, best_i = j - i, (first + i + int((j - i) * 0.2)) % n
+            i = j
+        else:
+            i += 1
     return best_i
 
 
-def generate(seed, road_width=None, shape=None, P=SETTINGS):
+def generate(seed, road_width=None, P=SETTINGS):
     width = sub_rng(seed, "width").range(P["width_min"], P["width_max"])
     width = road_width or width
-    shp = SHAPES[sub_rng(seed, "shape").int_incl(0, len(SHAPES) - 1)]
-    shp = shape or shp
-    hw = width / 2.0
     rng = sub_rng(seed, "layout")
     for attempt in range(1, P["max_attempts"] + 1):
-        dense, rmin_u, rmax_u = shape_points(shp, rng)
+        poly = control_polygon(rng, width, P)
         rot = rng.range(0.0, 2 * math.pi)
         flip = rng.uniform() < 0.5
-        u = rng.uniform()
-        nodes_u, _, L_u = resample_closed(dense, 0.05)
-        minr_u = min_radius(nodes_u)
-        s_lo = max(P["min_radius_factor"] * hw / minr_u, P["len_min"] / L_u, P["r_min"] / rmin_u)
-        s_hi = min(P["len_max"] / L_u, P["r_max"] / rmax_u)
-        if s_lo > s_hi:
+        dense, radii = fillet(poly, width, rng, P)
+        if dense is None:
             continue
-        s = s_lo + (s_hi - s_lo) * u
         c, sn = math.cos(rot), math.sin(rot)
-        pts = [(s * (x * c - z * sn), s * (x * sn + z * c)) for x, z in dense]
+        pts = [(x * c - z * sn, x * sn + z * c) for x, z in dense]
         if flip:
             pts.reverse()
         nodes, step, L = resample_closed(pts, P["node_spacing"])
         if check_rules(nodes, step, width, P):
             continue
-        st = straightest_start(nodes)
+        st = longest_straight_start(nodes, step, P)
         nodes = nodes[st:] + nodes[:st]
-        return {"seed": seed, "shape": shp, "width": width, "nodes": nodes, "step": step,
-                "length": L, "min_radius": min_radius(nodes), "attempts": attempt}
+        corners = sum(1 for x in radii if x != float("inf"))
+        return {"seed": seed, "shape": "circuit", "corners": corners, "width": width, "nodes": nodes,
+                "step": step, "length": L, "min_radius": min_radius(nodes), "attempts": attempt}
     return None
 
 
@@ -284,8 +384,8 @@ def draw(r, size=300):
         d.line([tp(p) for p in e + [e[0]]], fill=(255, 255, 255), width=1)
     x, y = tp(nodes[0])
     d.ellipse((x - 3, y - 3, x + 3, y + 3), fill=(255, 0, 0))
-    d.text((4, 2), "s%d %s w%.1f R%.1f R/hw%.1f L%.0f" % (
-        r["seed"], r["shape"], w, r["min_radius"], r["min_radius"] / (w / 2), r["length"]), fill=(255, 255, 255))
+    d.text((4, 2), "s%d c%d w%.1f R%.1f L%.0f a%d" % (
+        r["seed"], r["corners"], w, r["min_radius"], r["length"], r["attempts"]), fill=(255, 255, 255))
     return im
 
 
@@ -296,7 +396,7 @@ def main():
     ap.add_argument("--out", default="layout_sheet")
     a = ap.parse_args()
     if a.check:
-        fails, shapes = [], {}
+        fails, rs = [], []
         for seed in range(a.check):
             r = generate(seed)
             if r is None:
@@ -307,9 +407,13 @@ def main():
                 fails.append((seed, why))
             if generate(seed)["nodes"] != r["nodes"]:
                 fails.append((seed, "not deterministic"))
-            shapes[r["shape"]] = shapes.get(r["shape"], 0) + 1
+            rs.append(r)
         print("%d seeds: %s" % (a.check, "PASS" if not fails else "FAIL %r" % fails[:10]))
-        print("shapes:", shapes)
+        if rs:
+            q = lambda k: sorted(x[k] for x in rs)
+            for k in ("corners", "length", "width", "attempts"):
+                v = q(k)
+                print("%-8s min %.1f  median %.1f  max %.1f" % (k, v[0], v[len(v) // 2], v[-1]))
     if a.sheet:
         from PIL import Image
         os.makedirs(a.out, exist_ok=True)

@@ -6,6 +6,7 @@
 // _SegBand = (vMin, vMax, 0, 0): drivable band across the road in TEXTURE space (frac of the
 // _MainTex-transformed V coordinate). Pixels of a labelled object outside the band get class 0,
 // e.g. grass/kerbs painted at the sides of a road texture. vMin <= 0 / vMax >= 1 disable a side.
+// _SegBand.z = 1 additionally restricts the class to where the label texture _SegMask is road.
 // _SegId is deliberately NOT declared in a Properties block: that way the value comes either
 // from a MaterialPropertyBlock set by SegLabel, or from the global default (0 = background)
 // set with Shader.SetGlobalVector("_SegId", Vector4.zero).
@@ -52,6 +53,7 @@ Shader "Hidden/SegReplacement"
     };
 
     float4 _SegBand;
+    sampler2D _SegMask;   // label texture (R > 0.5 = road), point-filtered, no mips; see SegLabel.labelMask
 
     float4 segOut()
     {
@@ -59,10 +61,14 @@ Shader "Hidden/SegReplacement"
     }
 
     // uvT = TRANSFORM_TEX(texcoord, _MainTex), i.e. the coordinate the RGB shader samples with.
+    // _SegBand.z = 1: the object's class is only kept where the label texture _SegMask, sampled at
+    // that same coordinate, says road (tracks painted into a floor texture).
     float4 segOutBanded(float2 uvT)
     {
         float t = frac(uvT.y);
         bool inBand = (_SegBand.x <= 0.0 || t >= _SegBand.x) && (_SegBand.y >= 1.0 || t <= _SegBand.y);
+        if (_SegBand.z > 0.5)
+            inBand = inBand && tex2Dlod(_SegMask, float4(uvT, 0, 0)).r > 0.5;
         return float4(inBand ? _SegId.r : 0.0, 0, 0, 1);
     }
     ENDCG

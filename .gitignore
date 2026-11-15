@@ -76,6 +76,7 @@ __pycache__/
 # Outputs of the segmentation / trackgen test tools
 seg_check_out/
 layout_sheet/
+seg_masks_preview/
 
 # Local logs
 unitylog.txt

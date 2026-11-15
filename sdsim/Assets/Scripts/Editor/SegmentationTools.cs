@@ -38,6 +38,51 @@ public static class SegmentationTools
         Debug.Log(sb.ToString());
     }
 
+    /// <summary>
+    /// Batch mode: Unity.exe -batchmode -quit -projectPath sdsim -executeMethod SegmentationTools.BatchReport
+    ///   -segScenes circuit_launch,warren -segOut report.txt
+    /// Opens each scene and writes every renderer (mesh, world bounds, materials, shader, main texture
+    /// and its tiling) plus the scene's PathManager / RoadBuilder settings.
+    /// </summary>
+    public static void BatchReport()
+    {
+        string[] args = System.Environment.GetCommandLineArgs();
+        string scenes = "", outPath = "seg_report.txt";
+        for (int i = 0; i < args.Length - 1; i++)
+        {
+            if (args[i] == "-segScenes") scenes = args[i + 1];
+            if (args[i] == "-segOut") outPath = args[i + 1];
+        }
+        var sb = new StringBuilder();
+        foreach (string name in scenes.Split(','))
+        {
+            if (name.Length == 0) continue;
+            Scene scene = UnityEditor.SceneManagement.EditorSceneManager.OpenScene("Assets/Scenes/" + name + ".unity");
+            sb.AppendLine("== " + scene.name);
+            foreach (var rd in scene.GetRootGameObjects().SelectMany(g => g.GetComponentsInChildren<Renderer>(true)))
+            {
+                var mf = rd.GetComponent<MeshFilter>();
+                string mesh = mf != null && mf.sharedMesh != null ? mf.sharedMesh.name + " v" + mf.sharedMesh.vertexCount : "-";
+                string mats = string.Join(" | ", rd.sharedMaterials.Select(m => m == null ? "null" :
+                    m.name + " {" + m.shader.name + ", " + m.GetTag("RenderType", false, "-") +
+                    (m.HasProperty("_MainTex") && m.mainTexture != null
+                        ? ", tex " + m.mainTexture.name + " " + m.mainTexture.width + "x" + m.mainTexture.height +
+                          " st " + m.mainTextureScale + m.mainTextureOffset
+                        : "") + "}"));
+                sb.AppendLine(string.Format("{0}  [{1}{2}] mesh {3} bounds c{4} s{5} mats: {6}",
+                    GetPath(rd.transform), rd.GetType().Name,
+                    rd.enabled && rd.gameObject.activeInHierarchy ? "" : " HIDDEN",
+                    mesh, rd.bounds.center.ToString("F2"), rd.bounds.size.ToString("F2"), mats));
+            }
+            foreach (var pm in Object.FindObjectsOfType<PathManager>())
+                sb.AppendLine("PathManager " + GetPath(pm.transform) + ": " + EditorJsonUtility.ToJson(pm));
+            foreach (var rb in Object.FindObjectsOfType<RoadBuilder>())
+                sb.AppendLine("RoadBuilder " + GetPath(rb.transform) + ": width " + rb.roadWidth + " offset " + rb.roadOffsetW +
+                              " build " + rb.doBuildRoad);
+        }
+        System.IO.File.WriteAllText(outPath, sb.ToString());
+    }
+
     static string GetPath(Transform t)
     {
         string p = t.name;
